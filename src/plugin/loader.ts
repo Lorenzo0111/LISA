@@ -1,6 +1,6 @@
-import type { RegistrablePlugin } from ".";
 import { assistant } from "../assistant";
 import { createLogger } from "../services/logger";
+import type { RegistrablePlugin } from ".";
 
 export class PluginLoader {
   plugins: RegistrablePlugin[] = [];
@@ -50,7 +50,7 @@ export class PluginLoader {
       try {
         await plugin.unregister();
       } catch (e) {
-        this.logger.error(`Failed to unload plugin ${plugin.name}`, e);
+        this.logger.error({ err: e }, `Failed to unload plugin ${plugin.name}`);
       }
     }
 

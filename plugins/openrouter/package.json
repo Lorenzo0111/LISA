@@ -1,9 +1,9 @@
 {
-  "name": "openai",
+  "name": "openrouter",
   "module": "index.ts",
   "type": "module",
   "dependencies": {
-    "@ai-sdk/openai": "^3.0.29",
+    "@openrouter/ai-sdk-provider": "^2.2.3",
     "zod": "^4.3.6"
   },
   "peerDependencies": {

@@ -173,12 +173,3 @@ dist
 
 # Finder (MacOS) folder config
 .DS_Store
-
-*.db
-
-# Python
-**/venv/
-
-agent/
-
-src/generated/

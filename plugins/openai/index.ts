@@ -1,5 +1,5 @@
 import { createOpenAI } from "@ai-sdk/openai";
-import { z } from "zod";
+import { type ZodType, z } from "zod";
 import { BasicAIProvider } from "../../src/handlers/ai";
 import { RegistrablePlugin } from "../../src/plugin";
 
@@ -17,15 +17,13 @@ export default class OpenAIPlugin extends RegistrablePlugin {
     });
 
     this.assistant.setAI(
-      new BasicAIProvider(
-        openai((model?.value as string) ?? "gpt-4o-mini", {}),
-      ),
+      new BasicAIProvider(openai((model?.value as string) ?? "gpt-5-mini")),
     );
   }
 
   async unregister(): Promise<void> {}
 
-  override getSettings(): Record<string, z.ZodTypeAny> {
+  override getSettings(): Record<string, ZodType<unknown>> {
     return {
       OPENAI_BASE_URL: z
         .string()
@@ -36,7 +34,7 @@ export default class OpenAIPlugin extends RegistrablePlugin {
       OPENAI_MODEL: z
         .string()
         .optional()
-        .default("gpt-4o-mini")
+        .default("gpt-5-mini")
         .describe("Model to use for OpenAI API"),
     };
   }

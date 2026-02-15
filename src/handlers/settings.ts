@@ -1,5 +1,4 @@
 import type { ZodTypeAny } from "zod";
-import { type JsonSchema7Type, zodToJsonSchema } from "zod-to-json-schema";
 import { createLogger } from "../services/logger";
 import { prisma } from "../services/prisma";
 import { enabledPluginsSchema } from "../types/settings";
@@ -12,7 +11,7 @@ interface LoadedSetting<T> {
 export class SettingHandler {
   private readonly logger = createLogger("settings");
   private readonly settings: LoadedSetting<unknown>[] = [];
-  private readonly schemaRegistry: Record<string, JsonSchema7Type> = {};
+  private readonly schemaRegistry: Record<string, string> = {};
 
   async init() {
     this.registerPluginSettings({
@@ -60,18 +59,12 @@ export class SettingHandler {
       where: { key },
       update: {
         value: JSON.stringify(value),
-        jsonSchema:
-          jsonSchema ??
-          (this.schemaRegistry[key] &&
-            JSON.stringify(this.schemaRegistry[key])),
+        jsonSchema: jsonSchema ?? this.schemaRegistry[key],
       },
       create: {
         key,
         value: JSON.stringify(value),
-        jsonSchema:
-          jsonSchema ??
-          (this.schemaRegistry[key] &&
-            JSON.stringify(this.schemaRegistry[key])),
+        jsonSchema: jsonSchema ?? this.schemaRegistry[key],
       },
     });
 
@@ -87,7 +80,7 @@ export class SettingHandler {
       if (this.schemaRegistry[key])
         this.logger.warn(`Overwriting existing schema for setting ${key}`);
 
-      this.schemaRegistry[key] = zodToJsonSchema(schema, key);
+      this.schemaRegistry[key] = JSON.stringify(schema.toJSONSchema());
 
       await prisma.setting.upsert({
         where: {
@@ -95,10 +88,10 @@ export class SettingHandler {
         },
         create: {
           key,
-          jsonSchema: JSON.stringify(this.schemaRegistry[key]),
+          jsonSchema: this.schemaRegistry[key],
         },
         update: {
-          jsonSchema: JSON.stringify(this.schemaRegistry[key]),
+          jsonSchema: this.schemaRegistry[key],
         },
       });
     }
