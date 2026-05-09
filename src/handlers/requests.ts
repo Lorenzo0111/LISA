@@ -20,7 +20,7 @@ export class RequestHandler extends Handler {
     assistant.eventBus.emit("request:create", request);
 
     const previousMessages =
-      request.type === "USER"
+      !request.type || request.type === "USER"
         ? await prisma.message.findMany({
             where: {
               createdAt: { gte: new Date(Date.now() - 120000) },

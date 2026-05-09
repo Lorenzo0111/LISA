@@ -1,6 +1,6 @@
 import { assistant } from "../assistant";
 import { createLogger } from "../services/logger";
-import type { Tool } from "./tools";
+import type { AnyTool } from "./tools";
 
 export abstract class Handler {
   abstract readonly name: string;
@@ -10,7 +10,7 @@ export abstract class Handler {
   abstract load(): Promise<void>;
   abstract unload(): Promise<void>;
 
-  getTools(): Tool<any>[] {
+  getTools(): AnyTool[] {
     return [];
   }
 }

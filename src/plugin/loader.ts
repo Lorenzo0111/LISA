@@ -1,6 +1,6 @@
-import type { RegistrablePlugin } from ".";
 import { assistant } from "../assistant";
 import { createLogger } from "../services/logger";
+import type { RegistrablePlugin } from ".";
 
 export class PluginLoader {
   plugins: RegistrablePlugin[] = [];

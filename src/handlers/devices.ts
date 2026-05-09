@@ -1,7 +1,7 @@
 import z from "zod";
 import { DeviceManagerError, InvalidAdapterError } from "../types/errors";
 import { Handler } from "./handler";
-import type { Tool } from "./tools";
+import { type AnyTool, defineTool } from "./tools";
 
 export abstract class DeviceAction {
   abstract readonly id: string;
@@ -82,19 +82,19 @@ export class DeviceHandler extends Handler {
     return device.adapter.executeAction(device.id, actionId.toLowerCase());
   }
 
-  override getTools(): Tool<any>[] {
+  override getTools(): AnyTool[] {
     const self = this;
 
     return [
-      {
+      defineTool({
         name: "list",
         description: "List all devices",
         requiredArgs: z.object({}),
         async execute() {
           return { devices: await self.getDevices() };
         },
-      },
-      {
+      }),
+      defineTool({
         name: "get",
         description: "Get a specific device",
         requiredArgs: z.object({
@@ -106,8 +106,8 @@ export class DeviceHandler extends Handler {
 
           return device;
         },
-      },
-      {
+      }),
+      defineTool({
         name: "action",
         description: "Execute an action on a device",
         requiredArgs: z.object({
@@ -121,7 +121,7 @@ export class DeviceHandler extends Handler {
             success: res,
           };
         },
-      },
+      }),
     ];
   }
 }

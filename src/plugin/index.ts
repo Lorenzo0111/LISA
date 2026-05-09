@@ -1,6 +1,6 @@
 import type { ZodType } from "zod";
 import { assistant } from "../assistant";
-import type { Tool } from "../handlers/tools";
+import type { AnyTool } from "../handlers/tools";
 import { createLogger } from "../services/logger";
 
 export abstract class RegistrablePlugin {
@@ -15,7 +15,7 @@ export abstract class RegistrablePlugin {
     return {};
   }
 
-  getTools(): Tool<any>[] {
+  getTools(): AnyTool[] {
     return [];
   }
 }

@@ -1,7 +1,7 @@
 import { type Context, Telegraf } from "telegraf";
 import { message } from "telegraf/filters";
 import { z } from "zod";
-import { Tool } from "../../src/handlers/tools";
+import { type AnyTool, defineTool } from "../../src/handlers/tools";
 import { RegistrablePlugin } from "../../src/plugin";
 
 export default class TelegramPlugin extends RegistrablePlugin {
@@ -96,9 +96,9 @@ export default class TelegramPlugin extends RegistrablePlugin {
     };
   }
 
-  override getTools(): Tool<any>[] {
+  override getTools(): AnyTool[] {
     return [
-      {
+      defineTool({
         name: "send_message",
         description: "Send a message to a Telegram user",
         requiredArgs: z.object({
@@ -111,7 +111,7 @@ export default class TelegramPlugin extends RegistrablePlugin {
           await this.bot.telegram.sendMessage(args.user_id, args.message);
           return "Message sent successfully";
         },
-      },
+      }),
     ];
   }
 }

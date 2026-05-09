@@ -2,12 +2,12 @@ import {
   type Agent,
   type LanguageModel,
   type ModelMessage,
-  stepCountIs,
   type Tool,
-  tool,
   ToolLoopAgent,
+  tool,
 } from "ai";
 import { assistant } from "../assistant";
+import { generateSystemPrompt } from "../constants/ai";
 import type { Message } from "../generated/prisma/client";
 import type { ResponseType } from "../types/responses";
 
@@ -31,6 +31,7 @@ export class BasicAIProvider extends IntelligenceProvider {
     this.model = model;
 
     const tools: Record<string, Tool> = {};
+    const toolNames: Record<string, string> = {};
 
     for (const toolData of assistant.getHandler("tool").tools) {
       tools[toolData.name] = tool({
@@ -39,23 +40,35 @@ export class BasicAIProvider extends IntelligenceProvider {
         execute: async (args) =>
           await assistant.getHandler("tool").executeTool(toolData.name, args),
       });
+      toolNames[toolData.name] = toolData.description;
     }
 
     this.agent = new ToolLoopAgent({
       model: this.model,
-      instructions:
-        process.env.AI_SYSTEM_PROMPT ??
-        `You are a helpful voice assistant called Lisa.
-      Answer the user's question in a helpful and friendly manner.
-      You can use tools to trigger actions like turning on lights or setting reminders.
-      When you need to trigger an action for a device, retrieve the device and action id before triggering any action, you can do so by using the device-list or device-get tool.
-      You always have to give a response to the user's prompt, it can also just be an acknowledgment if an action was triggered.
-      
-      Don't respond with long paragraphs, keep it short and concise.
-      Don't use escape characters in your response, and don't use markdown formatting.
-      Always respond in the same language as the user's prompt.`,
+      prepareCall: async (settings) => {
+        const [AI_SYSTEM_PROMPT, AI_SYSTEM_MEMORY] = assistant
+          .getHandler("setting")
+          .getSettings(["AI_SYSTEM_PROMPT", "AI_SYSTEM_MEMORY"]);
+
+        let memoryTitles: Record<number, string> = {};
+
+        if (AI_SYSTEM_MEMORY?.value !== "0")
+          memoryTitles = await assistant.getHandler("memory").listTitles();
+
+        return {
+          ...settings,
+          instructions:
+            (AI_SYSTEM_PROMPT?.value as string) ??
+            generateSystemPrompt({
+              tools: toolNames,
+              memory: {
+                enabled: AI_SYSTEM_MEMORY?.value !== "0",
+                titles: memoryTitles,
+              },
+            }),
+        };
+      },
       tools,
-      stopWhen: stepCountIs(10),
       headers: {
         "X-Title": "LISA",
         "HTTP-Referer": "https://github.com/Lorenzo0111/LISA",
@@ -88,7 +101,7 @@ export class BasicAIProvider extends IntelligenceProvider {
       for (const [key, value] of Object.entries(context)) {
         contextStr += `${key}: ${value}, `;
       }
-      contextStr = contextStr.slice(0, -2) + "]";
+      contextStr = `${contextStr.slice(0, -2)}]`;
     }
 
     messages.push({

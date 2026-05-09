@@ -2,7 +2,7 @@ import z from "zod";
 import type { Timer } from "../generated/prisma/client";
 import { prisma } from "../services/prisma";
 import { Handler } from "./handler";
-import type { Tool } from "./tools";
+import { type AnyTool, defineTool } from "./tools";
 
 export class TimerHandler extends Handler {
   readonly name = "timer";
@@ -43,7 +43,12 @@ export class TimerHandler extends Handler {
     });
   }
 
-  async scheduleTimer(name: string, seconds: number, action: string) {
+  async scheduleTimer(
+    name: string,
+    seconds: number,
+    action: string,
+    context?: Record<string, string>,
+  ): Promise<Timer> {
     if (seconds < 0) throw new Error("Seconds must be a non-negative integer");
 
     const runAt = new Date(Date.now() + seconds * 1000);
@@ -53,6 +58,7 @@ export class TimerHandler extends Handler {
         name,
         runAt,
         action,
+        context,
       },
     });
 
@@ -82,23 +88,24 @@ export class TimerHandler extends Handler {
       this.assistant.getHandler("request").handleRequest({
         type: "TIMER",
         content: timer.action,
+        context: (timer.context as Record<string, string>) || {},
       });
     });
   }
 
-  override getTools(): Tool<any>[] {
+  override getTools(): AnyTool[] {
     const self = this;
 
     return [
-      {
+      defineTool({
         name: "list",
         description: "List all timers",
         requiredArgs: z.object({}),
         async execute() {
           return { timers: await self.getTimers() };
         },
-      },
-      {
+      }),
+      defineTool({
         name: "get",
         description: "Get a specific timer",
         requiredArgs: z.object({
@@ -110,11 +117,11 @@ export class TimerHandler extends Handler {
 
           return timer;
         },
-      },
-      {
+      }),
+      defineTool({
         name: "create",
         description:
-          "Create a new timer to run an action after a certain number of seconds",
+          "Create a new scheduled task that will run after a certain number of seconds",
         requiredArgs: z.object({
           name: z.string().describe("A small description of what timer is for"),
           seconds: z.number().min(0),
@@ -123,15 +130,26 @@ export class TimerHandler extends Handler {
             .describe(
               "The prompt that will be given to the assistant when the timer executes. The prompt will be sent on a blank session with the same tools you have now so include all the details and context needed",
             ),
+          context: z
+            .record(z.string(), z.string())
+            .optional()
+            .describe(
+              "Additional context to be passed when the timer executes. An example could be the platform and the user who created the request",
+            ),
         }),
         async execute(args) {
-          await self.scheduleTimer(args.name, args.seconds, args.action);
+          await self.scheduleTimer(
+            args.name,
+            args.seconds,
+            args.action,
+            args.context,
+          );
 
           return {
             success: true,
           };
         },
-      },
+      }),
     ];
   }
 }

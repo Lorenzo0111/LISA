@@ -1,29 +1,37 @@
-/** biome-ignore-all lint/suspicious/noExplicitAny: Any is required for schema shape */
 import type { z } from "zod";
 import { InvalidToolError } from "../types/errors";
 import { Handler } from "./handler";
 
-export abstract class Tool<T extends z.ZodObject<any> = z.ZodObject<any>> {
-  abstract readonly name: string;
-  abstract readonly description: string;
-  abstract readonly requiredArgs: T;
+export type ToolSchema = z.ZodObject<Record<string, z.ZodType<unknown>>>;
+export type AnyTool = Tool<ToolSchema>;
 
-  abstract execute(args: z.infer<T>): Promise<unknown>;
+export interface Tool<TSchema extends ToolSchema = ToolSchema> {
+  readonly name: string;
+  readonly description: string;
+  readonly requiredArgs: TSchema;
+
+  execute(args: z.infer<TSchema>): Promise<unknown>;
+}
+
+export function defineTool<const TSchema extends ToolSchema>(
+  tool: Tool<TSchema>,
+): Tool<TSchema> {
+  return tool;
 }
 
 export interface ToolRecorder {
   name: string;
-  getTools(): Tool<any>[];
+  getTools(): AnyTool[];
 }
 
 export class ToolHandler extends Handler {
   readonly name = "tool";
-  readonly tools: Tool<any>[] = [];
+  readonly tools: AnyTool[] = [];
 
   async load(): Promise<void> {}
   async unload(): Promise<void> {}
 
-  registerTool(tool: Tool<any>): void {
+  registerTool(tool: AnyTool): void {
     const existingTool = this.tools.find((t) => t.name === tool.name);
     if (existingTool)
       throw new InvalidToolError(`Tool with name ${tool.name} already exists`);
@@ -35,7 +43,7 @@ export class ToolHandler extends Handler {
     for (const tool of recorder.getTools())
       this.registerTool({
         ...tool,
-        name: `${recorder.name.replaceAll(" ", "_").toLowerCase()}:${tool.name}`,
+        name: `${recorder.name.replaceAll(" ", "_").toLowerCase()}-${tool.name}`,
         execute: tool.execute.bind(tool),
       });
   }
@@ -45,7 +53,8 @@ export class ToolHandler extends Handler {
     if (!tool) throw new InvalidToolError(`Tool with name ${name} not found`);
 
     this.logger().info(`Executing tool ${name}`);
-    const res = await tool.execute(args as z.infer<typeof tool.requiredArgs>);
+    const parsedArgs = tool.requiredArgs.parse(args);
+    const res = await tool.execute(parsedArgs);
 
     return res;
   }
