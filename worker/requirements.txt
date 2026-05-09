@@ -1,0 +1,11 @@
+PyAudio==0.2.14
+numpy==2.0.2
+librosa==0.11.0
+torch==2.8.0
+torchaudio==2.8.0
+openai-whisper==20250625
+silero-vad==6.2.1
+requests==2.32.5
+python-dotenv==1.2.1
+pydub==0.25.1
+pyttsx3==2.99

@@ -17,6 +17,7 @@ export abstract class IntelligenceProvider {
   abstract process(
     previousMessages: Message[],
     input: string,
+    context?: Record<string, string>,
   ): Promise<ResponseType>;
 }
 
@@ -31,12 +32,12 @@ export class BasicAIProvider extends IntelligenceProvider {
 
     const tools: Record<string, Tool> = {};
 
-    for (const toolData of assistant.toolsHandler.tools) {
+    for (const toolData of assistant.getHandler("tool").tools) {
       tools[toolData.name] = tool({
         description: toolData.description,
         inputSchema: toolData.requiredArgs,
         execute: async (args) =>
-          await assistant.toolsHandler.executeTool(toolData.name, args),
+          await assistant.getHandler("tool").executeTool(toolData.name, args),
       });
     }
 
@@ -50,7 +51,9 @@ export class BasicAIProvider extends IntelligenceProvider {
       When you need to trigger an action for a device, retrieve the device and action id before triggering any action, you can do so by using the device-list or device-get tool.
       You always have to give a response to the user's prompt, it can also just be an acknowledgment if an action was triggered.
       
-      Don't respond with long paragraphs, keep it short and concise.`,
+      Don't respond with long paragraphs, keep it short and concise.
+      Don't use escape characters in your response, and don't use markdown formatting.
+      Always respond in the same language as the user's prompt.`,
       tools,
       stopWhen: stepCountIs(10),
       headers: {
@@ -63,6 +66,7 @@ export class BasicAIProvider extends IntelligenceProvider {
   override async process(
     previousMessages: Message[],
     input: string,
+    context?: Record<string, string>,
   ): Promise<ResponseType> {
     const messages: ModelMessage[] = [];
 
@@ -78,9 +82,18 @@ export class BasicAIProvider extends IntelligenceProvider {
       });
     }
 
+    let contextStr = "";
+    if (context && Object.keys(context).length > 0) {
+      contextStr = "[";
+      for (const [key, value] of Object.entries(context)) {
+        contextStr += `${key}: ${value}, `;
+      }
+      contextStr = contextStr.slice(0, -2) + "]";
+    }
+
     messages.push({
       role: "user",
-      content: input,
+      content: `${contextStr} ${input}`,
     });
 
     const response = await this.agent.generate({ messages });

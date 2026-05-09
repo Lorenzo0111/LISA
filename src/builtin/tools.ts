@@ -2,8 +2,8 @@ import { z } from "zod";
 import { assistant } from "../assistant";
 
 export function registerBuiltInTools() {
-  assistant.toolsHandler.registerTool({
-    name: "random",
+  assistant.getHandler("tool").registerTool({
+    name: "builtin:random",
     description: "Generate a random number",
     requiredArgs: z.object({
       min: z.number(),
@@ -16,45 +16,16 @@ export function registerBuiltInTools() {
     },
   });
 
-  assistant.toolsHandler.registerTool({
-    name: "device-list",
-    description: "List all devices",
+  assistant.getHandler("tool").registerTool({
+    name: "builtin:get-date-time",
+    description: "Get the current date and time",
     requiredArgs: z.object({}),
     async execute() {
-      return { devices: await assistant.deviceHandler.getDevices() };
+      return { date: new Date().toString() };
     },
   });
 
-  assistant.toolsHandler.registerTool({
-    name: "device-get",
-    description: "Get a specific device",
-    requiredArgs: z.object({
-      idOrName: z.string(),
-    }),
-    async execute(args) {
-      const device = await assistant.deviceHandler.getDevice(args.idOrName);
-      if (!device) return { error: "Device not found" };
-
-      return device;
-    },
-  });
-
-  assistant.toolsHandler.registerTool({
-    name: "device-action",
-    description: "Execute an action on a device",
-    requiredArgs: z.object({
-      id: z.string(),
-      action: z.string(),
-    }),
-    async execute(args) {
-      const res = await assistant.deviceHandler.executeAction(
-        args.id,
-        args.action,
-      );
-
-      return {
-        success: res,
-      };
-    },
-  });
+  assistant.handlers.forEach((handler) =>
+    assistant.getHandler("tool").registerTools(handler),
+  );
 }

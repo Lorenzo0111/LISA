@@ -1,19 +1,19 @@
 import type { ZodTypeAny } from "zod";
-import { createLogger } from "../services/logger";
 import { prisma } from "../services/prisma";
 import { enabledPluginsSchema } from "../types/settings";
+import { Handler } from "./handler";
 
 interface LoadedSetting<T> {
   key: string;
   value: T;
 }
 
-export class SettingHandler {
-  private readonly logger = createLogger("settings");
+export class SettingHandler extends Handler {
+  readonly name = "setting";
   private readonly settings: LoadedSetting<unknown>[] = [];
   private readonly schemaRegistry: Record<string, string> = {};
 
-  async init() {
+  async load() {
     this.registerPluginSettings({
       ENABLED_PLUGINS: enabledPluginsSchema,
     });
@@ -26,8 +26,10 @@ export class SettingHandler {
       })),
     );
 
-    this.logger.info(`Loaded ${this.settings.length} settings`);
+    this.logger().info(`Loaded ${this.settings.length} settings`);
   }
+
+  async unload(): Promise<void> {}
 
   getSettings(keys: string[]): (LoadedSetting<unknown> | undefined)[] {
     const settings: (LoadedSetting<unknown> | undefined)[] = [];
@@ -78,7 +80,7 @@ export class SettingHandler {
   async registerPluginSettings(settings: Record<string, ZodTypeAny>) {
     for (const [key, schema] of Object.entries(settings)) {
       if (this.schemaRegistry[key])
-        this.logger.warn(`Overwriting existing schema for setting ${key}`);
+        this.logger().warn(`Overwriting existing schema for setting ${key}`);
 
       this.schemaRegistry[key] = JSON.stringify(schema.toJSONSchema());
 
@@ -96,7 +98,7 @@ export class SettingHandler {
       });
     }
 
-    this.logger.info(
+    this.logger().info(
       `Registered ${Object.keys(settings).length} plugin settings`,
     );
   }

@@ -40,5 +40,5 @@ export class ExampleAdapter implements DeviceAdapter {
 }
 
 export function registerTestingDevice() {
-  assistant.deviceHandler.registerAdapter(new ExampleAdapter());
+  assistant.getHandler("device").registerAdapter(new ExampleAdapter());
 }

@@ -5,7 +5,7 @@ import { assistant } from "../../assistant";
 
 export const settingsRoute = new Hono()
   .get("/", async (ctx) => {
-    const settings = assistant.settingsManager.allSettings();
+    const settings = assistant.getHandler("setting").allSettings();
 
     return ctx.json(settings);
   })
@@ -21,7 +21,7 @@ export const settingsRoute = new Hono()
       const key = ctx.req.param("key");
       const { value } = ctx.req.valid("json");
 
-      await assistant.settingsManager.setSetting(key, value);
+      await assistant.getHandler("setting").setSetting(key, value);
 
       return ctx.json({
         success: true,

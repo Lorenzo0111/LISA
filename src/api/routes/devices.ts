@@ -5,13 +5,13 @@ import { assistant } from "../../assistant";
 
 export const devicesRoute = new Hono()
   .get("/", async (ctx) => {
-    const devices = await assistant.deviceHandler.getDevices();
+    const devices = await assistant.getHandler("device").getDevices();
     return ctx.json(devices);
   })
   .get("/:id", async (ctx) => {
     const id = ctx.req.param("id");
 
-    const device = await assistant.deviceHandler.getDevice(id);
+    const device = await assistant.getHandler("device").getDevice(id);
     return ctx.json({
       ...device,
       adapter: undefined,
@@ -29,7 +29,9 @@ export const devicesRoute = new Hono()
       const id = ctx.req.param("id");
       const body = ctx.req.valid("json");
 
-      const res = await assistant.deviceHandler.executeAction(id, body.action);
+      const res = await assistant
+        .getHandler("device")
+        .executeAction(id, body.action);
       return ctx.json({
         success: res,
       });

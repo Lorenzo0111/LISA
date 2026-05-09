@@ -8,7 +8,7 @@ export const requestsRoute = new Hono().post(
   zValidator("json", requestSchema),
   async (ctx) => {
     const body = ctx.req.valid("json");
-    const res = await assistant.requestHandler.handleRequest(body);
+    const res = await assistant.getHandler("request").handleRequest(body);
 
     return ctx.json(res);
   },

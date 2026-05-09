@@ -24,16 +24,18 @@ const settingCommand: Command = {
         if (!key) return "Key is required";
 
         return (
-          JSON.stringify(assistant.settingsManager.getSetting(key)?.value) ??
-          "Not set"
+          JSON.stringify(
+            assistant.getHandler("setting").getSetting(key)?.value,
+          ) ?? "Not set"
         );
       case "set":
         if (!key) return "Key is required";
 
-        await assistant.settingsManager.setSetting(key, value);
+        await assistant.getHandler("setting").setSetting(key, value);
         return `Set ${key} to ${value}`;
       case "list":
-        return `\n${assistant.settingsManager
+        return `\n${assistant
+          .getHandler("setting")
           .allSettings()
           .map((s) => `${s.key}: ${JSON.stringify(s.value)}`)
           .join("\n")}`;
@@ -52,17 +54,16 @@ const enableCommand: Command = {
     const [plugin] = args;
 
     const enabledPlugins =
-      assistant.settingsManager.getSetting<string[]>("ENABLED_PLUGINS")
+      assistant.getHandler("setting").getSetting<string[]>("ENABLED_PLUGINS")
         ?.value ?? [];
 
     if (enabledPlugins[0] === "") enabledPlugins.shift();
     if (enabledPlugins.includes(plugin)) return "Plugin is already enabled";
 
     enabledPlugins.push(plugin);
-    await assistant.settingsManager.setSetting(
-      "ENABLED_PLUGINS",
-      enabledPlugins,
-    );
+    await assistant
+      .getHandler("setting")
+      .setSetting("ENABLED_PLUGINS", enabledPlugins);
 
     await assistant.pluginLoader.loadPlugin(plugin);
 

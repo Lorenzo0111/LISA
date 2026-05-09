@@ -7,9 +7,9 @@ export default class OpenAIPlugin extends RegistrablePlugin {
   readonly name = "openai";
 
   async register(): Promise<void> {
-    const [baseUrl, apiKey, model] = this.assistant.settingsManager.getSettings(
-      ["OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"],
-    );
+    const [baseUrl, apiKey, model] = this.assistant
+      .getHandler("setting")
+      .getSettings(["OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"]);
 
     const openai = createOpenAI({
       baseURL: baseUrl?.value as string,

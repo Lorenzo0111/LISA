@@ -14,9 +14,27 @@ model Setting {
 }
 
 model Message {
-  id        Int      @id @default(autoincrement())
-  createdAt DateTime @default(now())
-  request   String
-  response  String
+  id Int @id @default(autoincrement())
+
+  type     MessageType @default(USER)
+  request  String
+  response String
+
   tokens    Int
+  createdAt DateTime @default(now())
+}
+
+enum MessageType {
+  USER
+  TIMER
+}
+
+model Timer {
+  id       Int      @id @default(autoincrement())
+  name     String
+  action   String
+  runAt    DateTime
+  executed Boolean  @default(false)
+
+  createdAt DateTime @default(now())
 }

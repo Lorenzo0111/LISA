@@ -182,3 +182,5 @@ dist
 agent/
 
 src/generated/
+
+*.code-workspace

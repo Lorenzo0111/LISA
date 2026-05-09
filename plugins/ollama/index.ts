@@ -1,4 +1,4 @@
-import { createOllama } from "ollama-ai-provider";
+import { createOllama } from "ai-sdk-ollama";
 import { z } from "zod";
 import { BasicAIProvider } from "../../src/handlers/ai";
 import { RegistrablePlugin } from "../../src/plugin";
@@ -8,10 +8,9 @@ export default class OllamaPlugin extends RegistrablePlugin {
   readonly name = "ollama";
 
   async register(): Promise<void> {
-    const [modelId, baseUrl] = this.assistant.settingsManager.getSettings([
-      "OLLAMA_MODEL_ID",
-      "OLLAMA_BASE_URL",
-    ]);
+    const [modelId, baseUrl] = this.assistant
+      .getHandler("setting")
+      .getSettings(["OLLAMA_MODEL_ID", "OLLAMA_BASE_URL"]);
 
     if (!modelId || !baseUrl)
       throw new InvalidToolError("OLLAMA model ID or base URL not set");

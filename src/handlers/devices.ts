@@ -1,5 +1,7 @@
-import { createLogger } from "../services/logger";
+import z from "zod";
 import { DeviceManagerError, InvalidAdapterError } from "../types/errors";
+import { Handler } from "./handler";
+import type { Tool } from "./tools";
 
 export abstract class DeviceAction {
   abstract readonly id: string;
@@ -26,9 +28,12 @@ export interface DeviceAdapter {
   executeAction(deviceId: string, actionId: string): Promise<boolean>;
 }
 
-export class DeviceHandler {
-  private readonly logger = createLogger("device-manager");
+export class DeviceHandler extends Handler {
+  readonly name = "device";
   private readonly adapters: DeviceAdapter[] = [];
+
+  async load(): Promise<void> {}
+  async unload(): Promise<void> {}
 
   registerAdapter(adapter: DeviceAdapter): void {
     const existingAdapter = this.adapters.find((d) => d.name === adapter.name);
@@ -70,10 +75,53 @@ export class DeviceHandler {
     if (!action)
       throw new DeviceManagerError(`Action with id ${actionId} not found`);
 
-    this.logger.info(
+    this.logger().info(
       `Executing action ${action.name} on device ${device.name}`,
     );
 
     return device.adapter.executeAction(device.id, actionId.toLowerCase());
+  }
+
+  override getTools(): Tool<any>[] {
+    const self = this;
+
+    return [
+      {
+        name: "list",
+        description: "List all devices",
+        requiredArgs: z.object({}),
+        async execute() {
+          return { devices: await self.getDevices() };
+        },
+      },
+      {
+        name: "get",
+        description: "Get a specific device",
+        requiredArgs: z.object({
+          idOrName: z.string(),
+        }),
+        async execute(args) {
+          const device = await self.getDevice(args.idOrName);
+          if (!device) return { error: "Device not found" };
+
+          return device;
+        },
+      },
+      {
+        name: "action",
+        description: "Execute an action on a device",
+        requiredArgs: z.object({
+          id: z.string(),
+          action: z.string(),
+        }),
+        async execute(args) {
+          const res = await self.executeAction(args.id, args.action);
+
+          return {
+            success: res,
+          };
+        },
+      },
+    ];
   }
 }

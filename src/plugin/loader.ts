@@ -1,6 +1,6 @@
+import type { RegistrablePlugin } from ".";
 import { assistant } from "../assistant";
 import { createLogger } from "../services/logger";
-import type { RegistrablePlugin } from ".";
 
 export class PluginLoader {
   plugins: RegistrablePlugin[] = [];
@@ -8,7 +8,7 @@ export class PluginLoader {
 
   async loadPlugins(): Promise<void> {
     const loadedPlugins =
-      assistant.settingsManager.getSetting<string[]>("ENABLED_PLUGINS")
+      assistant.getHandler("setting").getSetting<string[]>("ENABLED_PLUGINS")
         ?.value ?? [];
 
     if (loadedPlugins[0] === "") loadedPlugins.shift();
@@ -31,9 +31,11 @@ export class PluginLoader {
       const instance: RegistrablePlugin = new PluginModule();
       await instance.register();
 
-      await assistant.settingsManager.registerPluginSettings(
-        instance.getSettings(),
-      );
+      await assistant
+        .getHandler("setting")
+        .registerPluginSettings(instance.getSettings());
+
+      assistant.getHandler("tool").registerTools(instance);
 
       this.plugins.push(instance);
     } catch (e) {

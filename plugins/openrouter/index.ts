@@ -7,10 +7,9 @@ export default class OpenRouterPlugin extends RegistrablePlugin {
   readonly name = "openrouter";
 
   async register(): Promise<void> {
-    const [apiKey, model] = this.assistant.settingsManager.getSettings([
-      "OPENROUTER_API_KEY",
-      "OPENROUTER_MODEL",
-    ]);
+    const [apiKey, model] = this.assistant
+      .getHandler("setting")
+      .getSettings(["OPENROUTER_API_KEY", "OPENROUTER_MODEL"]);
 
     const openrouter = createOpenRouter({
       apiKey: apiKey?.value as string,

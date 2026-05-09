@@ -3,10 +3,10 @@
   "module": "index.ts",
   "type": "module",
   "dependencies": {
-    "@ai-sdk/openai": "^3.0.29",
-    "zod": "^4.3.6"
+    "@ai-sdk/openai": "^3.0.62",
+    "zod": "^4.4.3"
   },
   "peerDependencies": {
-    "typescript": "^5.0.0"
+    "typescript": "^6.0.3"
   }
 }

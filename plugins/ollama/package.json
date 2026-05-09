@@ -3,9 +3,9 @@
   "module": "index.ts",
   "type": "module",
   "dependencies": {
-    "ollama-ai-provider": "^1.2.0"
+    "ai-sdk-ollama": "^3.8.3"
   },
   "peerDependencies": {
-    "typescript": "^5.0.0"
+    "typescript": "^6.0.3"
   }
 }
