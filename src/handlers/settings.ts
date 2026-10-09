@@ -1,6 +1,9 @@
 import type { ZodTypeAny } from "zod";
 import { prisma } from "../services/prisma";
-import { enabledPluginsSchema } from "../types/settings";
+import {
+  defaultNotificationChannelSchema,
+  enabledPluginsSchema,
+} from "../types/settings";
 import { Handler } from "./handler";
 
 interface LoadedSetting<T> {
@@ -16,6 +19,7 @@ export class SettingHandler extends Handler {
   async load() {
     this.registerPluginSettings({
       ENABLED_PLUGINS: enabledPluginsSchema,
+      NOTIFICATION_DEFAULT_CHANNEL: defaultNotificationChannelSchema,
     });
 
     const dbSettings = await prisma.setting.findMany();

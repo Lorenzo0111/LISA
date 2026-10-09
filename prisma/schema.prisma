@@ -35,6 +35,7 @@ model Timer {
   name    String
   action  String
   runAt   DateTime
+  cron    String?
   context Json?
 
   executed  Boolean  @default(false)

@@ -3,16 +3,29 @@ import { DeviceManagerError, InvalidAdapterError } from "../types/errors";
 import { Handler } from "./handler";
 import { type AnyTool, defineTool } from "./tools";
 
+export interface DeviceActionParameter {
+  type: "string" | "number" | "boolean";
+  description?: string;
+  required?: boolean;
+}
+
+export type DeviceActionParams = Record<string, unknown>;
+
 export abstract class DeviceAction {
   abstract readonly id: string;
   abstract readonly name: string;
   abstract readonly description: string;
+  readonly parameters?: Record<string, DeviceActionParameter>;
 }
 
 export interface Device {
   id: string;
   name: string;
   actions: DeviceAction[];
+  /** Kind of device, for example light or thermostat. */
+  type?: string;
+  /** Current state as last reported by the adapter. */
+  state?: Record<string, unknown>;
 }
 
 export type AdaptedDevice = {
@@ -25,7 +38,11 @@ export interface DeviceAdapter {
   getDevices(): Promise<Device[]>;
   getDevice(idOrName: string): Promise<Device | null>;
 
-  executeAction(deviceId: string, actionId: string): Promise<boolean>;
+  executeAction(
+    deviceId: string,
+    actionId: string,
+    params?: DeviceActionParams,
+  ): Promise<boolean>;
 }
 
 export class DeviceHandler extends Handler {
@@ -66,7 +83,11 @@ export class DeviceHandler extends Handler {
     return null;
   }
 
-  async executeAction(deviceId: string, actionId: string): Promise<boolean> {
+  async executeAction(
+    deviceId: string,
+    actionId: string,
+    params: DeviceActionParams = {},
+  ): Promise<boolean> {
     const device = await this.getDevice(deviceId);
     if (!device)
       throw new DeviceManagerError(`Device with id ${deviceId} not found`);
@@ -75,11 +96,28 @@ export class DeviceHandler extends Handler {
     if (!action)
       throw new DeviceManagerError(`Action with id ${actionId} not found`);
 
+    for (const [name, parameter] of Object.entries(action.parameters ?? {})) {
+      const value = params[name];
+
+      if (value === undefined) {
+        if (parameter.required)
+          throw new DeviceManagerError(
+            `Action ${action.id} requires the ${name} parameter`,
+          );
+        continue;
+      }
+
+      if (typeof value !== parameter.type)
+        throw new DeviceManagerError(
+          `Parameter ${name} of action ${action.id} must be a ${parameter.type}`,
+        );
+    }
+
     this.logger().info(
       `Executing action ${action.name} on device ${device.name}`,
     );
 
-    return device.adapter.executeAction(device.id, actionId.toLowerCase());
+    return device.adapter.executeAction(device.id, action.id, params);
   }
 
   override getTools(): AnyTool[] {
@@ -88,15 +126,35 @@ export class DeviceHandler extends Handler {
     return [
       defineTool({
         name: "list",
-        description: "List all devices",
-        requiredArgs: z.object({}),
-        async execute() {
-          return { devices: await self.getDevices() };
+        description:
+          "List devices with their current state. Use device-get to see the actions a device supports",
+        requiredArgs: z.object({
+          query: z
+            .string()
+            .optional()
+            .describe(
+              "Only return devices whose id, name or type contains this text",
+            ),
+        }),
+        async execute(args) {
+          const query = args.query?.toLowerCase();
+          const devices = (await self.getDevices()).filter(
+            (device) =>
+              !query ||
+              [device.id, device.name, device.type ?? ""].some((value) =>
+                value.toLowerCase().includes(query),
+              ),
+          );
+
+          return {
+            devices: devices.map(({ actions: _, ...device }) => device),
+          };
         },
       }),
       defineTool({
         name: "get",
-        description: "Get a specific device",
+        description:
+          "Get a specific device, including its current state and the actions it supports with their parameters",
         requiredArgs: z.object({
           idOrName: z.string(),
         }),
@@ -104,7 +162,8 @@ export class DeviceHandler extends Handler {
           const device = await self.getDevice(args.idOrName);
           if (!device) return { error: "Device not found" };
 
-          return device;
+          const { adapter: _, ...details } = device;
+          return details;
         },
       }),
       defineTool({
@@ -113,9 +172,19 @@ export class DeviceHandler extends Handler {
         requiredArgs: z.object({
           id: z.string(),
           action: z.string(),
+          params: z
+            .record(z.string(), z.unknown())
+            .optional()
+            .describe(
+              "Values for the parameters the action accepts, as listed by device-get",
+            ),
         }),
         async execute(args) {
-          const res = await self.executeAction(args.id, args.action);
+          const res = await self.executeAction(
+            args.id,
+            args.action,
+            args.params,
+          );
 
           return {
             success: res,

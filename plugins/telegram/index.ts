@@ -1,12 +1,28 @@
 import { type Context, Telegraf } from "telegraf";
 import { message } from "telegraf/filters";
 import { z } from "zod";
+import type { NotificationChannel } from "../../src/handlers/notifications";
 import { type AnyTool, defineTool } from "../../src/handlers/tools";
 import { RegistrablePlugin } from "../../src/plugin";
 
 export default class TelegramPlugin extends RegistrablePlugin {
   readonly name = "telegram";
   private bot?: Telegraf;
+  private readonly channel: NotificationChannel = {
+    name: "telegram",
+    description:
+      "Telegram message. The target is a Telegram user id, every authorized user receives it when omitted",
+    send: async (message, target) => {
+      if (!this.bot) throw new Error("Bot is not initialized");
+
+      const recipients = target ? [target] : this.authorizedUsers();
+      if (recipients.length === 0)
+        throw new Error("No authorized Telegram users to notify");
+
+      for (const recipient of recipients)
+        await this.bot.telegram.sendMessage(recipient, message);
+    },
+  };
 
   async register(): Promise<void> {
     const token = this.assistant
@@ -37,6 +53,8 @@ export default class TelegramPlugin extends RegistrablePlugin {
     this.bot.on(message("text"), this.onMessage.bind(this));
     this.bot.launch();
 
+    this.assistant.getHandler("notification").registerChannel(this.channel);
+
     this.assistant.cli.registerCommand({
       name: "telegram",
       description: "Telegram commands",
@@ -66,6 +84,15 @@ export default class TelegramPlugin extends RegistrablePlugin {
     });
   }
 
+  private authorizedUsers(): string[] {
+    const authorized =
+      this.assistant
+        .getHandler("setting")
+        .getSetting<string[]>("TELEGRAM_AUTHORIZED_USERS")?.value || [];
+
+    return authorized.filter((id) => id !== "");
+  }
+
   async onStart(ctx: Context) {
     await ctx.reply("Welcome to the assistant! How can I help you?");
   }
@@ -83,6 +110,7 @@ export default class TelegramPlugin extends RegistrablePlugin {
   }
 
   async unregister(): Promise<void> {
+    this.assistant.getHandler("notification").unregisterChannel(this.channel);
     this.bot?.stop();
   }
 

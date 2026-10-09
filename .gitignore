@@ -184,3 +184,8 @@ agent/
 src/generated/
 
 *.code-workspace
+# Downloaded Piper voices
+worker/voices/
+
+# Listener debug recordings
+worker/debug/

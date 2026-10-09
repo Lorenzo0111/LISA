@@ -1,25 +1,219 @@
+import json
 import os
 import sys
 import re
 import time
+import queue
+import threading
+import unicodedata
+import wave
+from difflib import SequenceMatcher
+from pathlib import Path
 import requests
 import numpy as np
 from collections import deque
-from typing import Optional
+from typing import List, Optional
 from dotenv import load_dotenv
-import subprocess
-import platform
 
 # Audio processing
 import pyaudio
 
 # Speech Recognition
-import whisper
-import torch
-from silero_vad import get_speech_timestamps, load_silero_vad
+from faster_whisper import WhisperModel
+from faster_whisper.vad import get_vad_model
+
+from tts import Speaker
 
 # Configuration
 load_dotenv()
+
+# Whisper and Silero VAD both work on 16 kHz mono audio
+SAMPLE_RATE = 16000
+# Silero VAD consumes fixed 32 ms frames, carrying 64 samples of context between them
+VAD_FRAME_SAMPLES = 512
+VAD_CONTEXT_SAMPLES = 64
+
+DEBUG_DIR = Path(__file__).resolve().parent / "debug"
+
+
+class StreamingVAD:
+    """Frame-by-frame Silero VAD on ONNX Runtime (no PyTorch required)."""
+
+    def __init__(self):
+        # Reuse the Silero model that ships with faster-whisper
+        self.session = get_vad_model().session
+        self.reset()
+
+    def reset(self) -> None:
+        self.h = np.zeros((1, 1, 128), dtype=np.float32)
+        self.c = np.zeros((1, 1, 128), dtype=np.float32)
+        self.context = np.zeros((1, VAD_CONTEXT_SAMPLES), dtype=np.float32)
+
+    def __call__(self, frame: np.ndarray) -> float:
+        """Return the speech probability of a single 512-sample frame."""
+        x = np.concatenate([self.context, frame.reshape(1, -1)], axis=1)
+        probs, self.h, self.c = self.session.run(None, {"input": x, "h": self.h, "c": self.c})
+        self.context = x[:, -VAD_CONTEXT_SAMPLES:]
+        return float(probs[0])
+
+
+class Microphone:
+    """Reads the microphone on a background thread and exposes 16 kHz VAD-sized frames.
+
+    Capturing on its own thread means no audio is lost while Whisper is busy,
+    which matters on slow boards where a transcription can take a second or two.
+    """
+
+    def __init__(self, audio: pyaudio.PyAudio, device_id: Optional[int] = None, max_queue_seconds: float = 30.0):
+        self.audio = audio
+        # Use PCM int16 for input because some macOS/PortAudio builds crash when
+        # reading float32 microphone streams, even though the rest of the pipeline
+        # expects float32 values internally.
+        self.FORMAT = pyaudio.paInt16
+        self.CHANNELS = 1
+        self.device_id = self._validate_input_device(device_id)
+        self.input_rate = self._resolve_input_sample_rate()
+        self.resampler = None
+        if self.input_rate != SAMPLE_RATE:
+            import soxr
+
+            self.resampler = soxr.ResampleStream(self.input_rate, SAMPLE_RATE, 1, dtype="float32")
+            print(f"[INFO] Microphone runs at {self.input_rate} Hz; resampling to {SAMPLE_RATE} Hz")
+
+        # Read ~32 ms at a time so each read yields about one VAD frame
+        self.chunk_size = int(VAD_FRAME_SAMPLES * self.input_rate / SAMPLE_RATE)
+        self.frames: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=int(max_queue_seconds * SAMPLE_RATE / VAD_FRAME_SAMPLES))
+        self.muted = False
+        self.stream = None
+        self.thread: Optional[threading.Thread] = None
+        self.running = False
+
+    def _validate_input_device(self, device_id: Optional[int]) -> Optional[int]:
+        """Fall back to the default mic when the configured device is missing.
+
+        PyAudio segfaults instead of raising when asked to open a device index
+        that does not exist, and macOS indices shift as devices come and go.
+        """
+        if device_id is None:
+            return None
+
+        if 0 <= device_id < self.audio.get_device_count():
+            info = self.audio.get_device_info_by_index(device_id)
+            if int(info.get("maxInputChannels", 0) or 0) > 0:
+                return device_id
+            reason = f"'{info.get('name')}' has no input channels"
+        else:
+            reason = "no such device"
+
+        print(f"[WARN] Audio device {device_id} is not usable ({reason}); using the default input device")
+        print("[WARN] Run with --list-devices and update AUDIO_DEVICE_ID")
+        return None
+
+    def _resolve_input_sample_rate(self) -> int:
+        """Capture at 16 kHz when the mic supports it, otherwise at its native rate.
+
+        Many USB microphones on Linux/ALSA only offer 44.1 or 48 kHz.
+        """
+        try:
+            if self.device_id is None:
+                info = self.audio.get_default_input_device_info()
+            else:
+                info = self.audio.get_device_info_by_index(self.device_id)
+        except Exception:
+            return SAMPLE_RATE
+
+        try:
+            self.audio.is_format_supported(
+                SAMPLE_RATE,
+                input_device=int(info["index"]),
+                input_channels=self.CHANNELS,
+                input_format=self.FORMAT,
+            )
+            return SAMPLE_RATE
+        except ValueError:
+            return int(float(info.get("defaultSampleRate") or SAMPLE_RATE))
+
+    def start(self) -> None:
+        self.stream = self.audio.open(
+            format=self.FORMAT,
+            channels=self.CHANNELS,
+            rate=self.input_rate,
+            input=True,
+            input_device_index=self.device_id,
+            frames_per_buffer=self.chunk_size,
+        )
+        self.running = True
+        self.thread = threading.Thread(target=self._capture_loop, name="microphone", daemon=True)
+        self.thread.start()
+
+    def _capture_loop(self) -> None:
+        pending = np.array([], dtype=np.float32)
+
+        while self.running and self.stream is not None:
+            try:
+                data = self.stream.read(self.chunk_size, exception_on_overflow=False)
+            except Exception as exc:
+                if self.running:
+                    print(f"[ERROR] Error reading audio: {exc}")
+                    time.sleep(0.1)
+                continue
+
+            if self.muted:
+                pending = np.array([], dtype=np.float32)
+                continue
+
+            samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+            if self.resampler is not None:
+                samples = self.resampler.resample_chunk(samples)
+
+            pending = np.concatenate([pending, samples])
+            while len(pending) >= VAD_FRAME_SAMPLES:
+                self._push(pending[:VAD_FRAME_SAMPLES])
+                pending = pending[VAD_FRAME_SAMPLES:]
+
+    def _push(self, frame: np.ndarray) -> None:
+        try:
+            self.frames.put_nowait(frame)
+        except queue.Full:
+            # The consumer fell far behind; drop the oldest audio
+            try:
+                self.frames.get_nowait()
+            except queue.Empty:
+                pass
+            self.frames.put_nowait(frame)
+
+    def read_frame(self, timeout: float = 0.5) -> Optional[np.ndarray]:
+        try:
+            return self.frames.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def mute(self) -> None:
+        """Discard microphone input, e.g. while the assistant itself is speaking."""
+        self.muted = True
+
+    def unmute(self) -> None:
+        self.flush()
+        self.muted = False
+
+    def flush(self) -> None:
+        while True:
+            try:
+                self.frames.get_nowait()
+            except queue.Empty:
+                return
+
+    def stop(self) -> None:
+        self.running = False
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+            self.thread = None
+
+        if self.stream is not None:
+            self.stream.stop_stream()
+            self.stream.close()
+            self.stream = None
+
 
 class VoiceActivationListener:
     def __init__(
@@ -29,337 +223,326 @@ class VoiceActivationListener:
         api_url: Optional[str] = None,
         api_key: Optional[str] = None,
         device_id: Optional[int] = None,
-        sample_rate: int = 16000,
-        chunk_size: int = 1024,
-        energy_threshold: float = 0.01,
-        speech_trigger_rms: float = 0.008,
-        wake_check_interval: float = 1.0,
-        min_trigger_interval: float = 2.5,
-        wake_prepend_seconds: float = 3.0,
+        vad_threshold: float = 0.5,
+        end_silence_seconds: Optional[float] = None,
+        max_utterance_seconds: float = 15.0,
+        follow_up_seconds: float = 6.0,
         wake_model_name: Optional[str] = None,
         transcription_model_name: Optional[str] = None,
-        calibrate_seconds: float = 1.5,
+        keyword_aliases: Optional[List[str]] = None,
+        debug: bool = False,
     ):
         self.keyword = keyword.lower()
-        self.normalized_keyword = self._normalize_text(self.keyword)
+        # Aliases cover spellings Whisper tends to produce for the wake word (e.g. "liza")
+        self.keywords = [k for k in (self._normalize_text(k) for k in [self.keyword, *(keyword_aliases or [])]) if k]
         self.language = language.lower() if language else None
         self.api_url = api_url or os.getenv("ASSISTANT_API_URL", "http://localhost:3000")
         self.api_key = api_key or os.getenv("ASSISTANT_API_KEY", "")
-        self.device_id = device_id
-        self.sample_rate = sample_rate
-        self.chunk_size = chunk_size
-        self.energy_threshold = energy_threshold
-        self.speech_trigger_rms = speech_trigger_rms
-        self.wake_check_interval = wake_check_interval
-        self.min_trigger_interval = min_trigger_interval
-        self.wake_prepend_seconds = wake_prepend_seconds
-        self.calibrate_seconds = calibrate_seconds
+        # Name this listener registers under to receive notifications (timers, reminders)
+        self.channel = os.getenv("ASSISTANT_CHANNEL", "voice")
+        self.notifications: "queue.Queue[str]" = queue.Queue()
+        self.vad_threshold = vad_threshold
+        # Hysteresis: once speaking, require a clearly lower probability to count as silence
+        self.vad_end_threshold = max(vad_threshold - 0.15, 0.05)
+        if end_silence_seconds is None:
+            end_silence_seconds = float(os.getenv("END_SILENCE_SECONDS", 0.8))
+        self.end_silence_frames = self._seconds_to_frames(end_silence_seconds)
+        self.debug = debug
+        self.max_utterance_frames = self._seconds_to_frames(max_utterance_seconds)
+        self.min_speech_frames = self._seconds_to_frames(0.25)
+        self.follow_up_seconds = follow_up_seconds
         self.wake_model_name = wake_model_name or os.getenv("WAKE_MODEL", "tiny")
         self.transcription_model_name = transcription_model_name or os.getenv("TRANSCRIPTION_MODEL", "small")
-        self.device = self._pick_torch_device()
-        self.fp16 = self.device == "cuda"
-        
-        # Audio configuration
-        self.FORMAT = pyaudio.paFloat32
-        self.CHANNELS = 1
-        
-        # Initialize audio stream
-        self.audio = pyaudio.PyAudio()
-        self.stream = None
-        self.is_listening = False
-        
-        print(f"[INFO] Loading Whisper wake model ({self.wake_model_name}) on {self.device}...")
-        self.wake_model = whisper.load_model(self.wake_model_name, device=self.device)
+        self.device = os.getenv("WHISPER_DEVICE", "auto")
+        # int8 quantization roughly halves memory and is the fastest option on CPUs
+        self.compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "default" if self.device == "cuda" else "int8")
+        self.cpu_threads = int(os.getenv("WHISPER_THREADS", 0))
+        self.beam_size = int(os.getenv("WHISPER_BEAM_SIZE", 5))
 
-        print(f"[INFO] Loading Whisper transcription model ({self.transcription_model_name}) on {self.device}...")
-        self.whisper_model = whisper.load_model(self.transcription_model_name, device=self.device)
+        self.audio = pyaudio.PyAudio()
+        self.microphone = Microphone(self.audio, device_id)
+        self.is_listening = False
+
+        print(f"[INFO] Loading Whisper wake model ({self.wake_model_name}, {self.compute_type})...")
+        self.wake_model = self._load_whisper(self.wake_model_name)
+
+        if self.transcription_model_name == self.wake_model_name:
+            self.whisper_model = self.wake_model
+        else:
+            print(f"[INFO] Loading Whisper transcription model ({self.transcription_model_name}, {self.compute_type})...")
+            self.whisper_model = self._load_whisper(self.transcription_model_name)
 
         print("[INFO] Loading Silero VAD model...")
-        self.vad_model = load_silero_vad()
-        
+        self.vad = StreamingVAD()
+
+        self.speaker = Speaker(self.audio, language=self.language)
+
+        # Utterance segmentation state
+        self.pre_roll: "deque[np.ndarray]" = deque(maxlen=self._seconds_to_frames(0.3))
+        self.utterance: List[np.ndarray] = []
+        self.speech_frames = 0
+        self.silent_frames = 0
+        self.awaiting_command_until = 0.0
+
         print("[INFO] Voice activation listener initialized")
         print(f"[INFO] Keyword: '{self.keyword}'")
         print(f"[INFO] Language: {self.language or 'auto'}")
         print(f"[INFO] API URL: {self.api_url}")
-        print(f"[INFO] Silence threshold (RMS): {self.energy_threshold}")
 
-    def _pick_torch_device(self) -> str:
-        """Choose the fastest usable Whisper device."""
-        if torch.cuda.is_available():
-            return "cuda"
+    def _seconds_to_frames(self, seconds: float) -> int:
+        return max(1, int(seconds * SAMPLE_RATE / VAD_FRAME_SAMPLES))
 
-        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            # openai-whisper still has rough edges on MPS; opt in explicitly.
-            if os.getenv("WHISPER_DEVICE", "").lower() == "mps":
-                return "mps"
-
-        return os.getenv("WHISPER_DEVICE", "cpu")
-
-    def _get_audio_energy(self, audio_chunk: np.ndarray) -> float:
-        """Calculate RMS energy of audio chunk"""
-        if len(audio_chunk) == 0:
-            return 0.0
-        return float(np.sqrt(np.mean(np.square(audio_chunk))))
+    def _load_whisper(self, name: str) -> WhisperModel:
+        return WhisperModel(name, device=self.device, compute_type=self.compute_type, cpu_threads=self.cpu_threads)
 
     def _normalize_text(self, text: str) -> str:
         """Normalize text to improve wake-phrase matching."""
-        normalized = re.sub(r"[^a-z0-9\s]", " ", text.lower())
+        text = unicodedata.normalize("NFKD", text.lower())
+        text = "".join(ch for ch in text if not unicodedata.combining(ch))
+        normalized = re.sub(r"[^a-z0-9\s]", " ", text)
         return " ".join(normalized.split())
 
-    def _to_audio_array(self, audio_buffer) -> np.ndarray:
-        """Convert buffered audio into a contiguous float32 array."""
-        return np.asarray(audio_buffer, dtype=np.float32).copy()
+    def _contains_keyword(self, text: str) -> bool:
+        """Match the wake word as whole words so 'lisa' does not fire on 'elisabetta'."""
+        padded = f" {self._normalize_text(text)} "
+        return any(f" {keyword} " in padded for keyword in self.keywords)
 
-    def _prepare_audio(self, audio: np.ndarray, trim_silence: bool = True) -> np.ndarray:
-        """Normalize and optionally trim audio before sending it to Whisper."""
-        if len(audio) == 0:
-            return np.array([], dtype=np.float32)
+    def _maybe_keyword(self, text: str) -> bool:
+        """Loose match for the wake model, which often misspells names ('liza', 'elisa').
 
-        audio = np.asarray(audio, dtype=np.float32)
-        audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
-        audio = np.clip(audio, -1.0, 1.0)
+        A loose match only earns a second opinion from the transcription model,
+        which still has to hear the exact wake word.
+        """
+        if self._contains_keyword(text):
+            return True
+
+        words = self._normalize_text(text).split()
+        for keyword in self.keywords:
+            size = len(keyword.split())
+            for i in range(len(words) - size + 1):
+                candidate = " ".join(words[i:i + size])
+                if SequenceMatcher(None, keyword, candidate).ratio() >= 0.7:
+                    return True
+        return False
+
+    def _prepare_audio(self, audio: np.ndarray) -> np.ndarray:
+        """Remove DC offset and bring quiet microphones up to a level Whisper handles well."""
         audio = audio - float(np.mean(audio))
-
-        if trim_silence:
-            audio = self._trim_to_speech(audio)
-
         peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
         if peak > 0:
-            audio = audio * min(1.0 / peak, 8.0)
+            audio = audio * min(0.9 / peak, 20.0)
+        return audio.astype(np.float32)
 
-        return np.clip(audio, -1.0, 1.0).astype(np.float32)
-
-    def _trim_to_speech(self, audio: np.ndarray) -> np.ndarray:
-        """Use Silero VAD to remove leading/trailing non-speech for cleaner transcripts."""
-        if len(audio) < int(self.sample_rate * 0.2):
-            return audio
-
-        try:
-            speech = get_speech_timestamps(
-                torch.from_numpy(audio),
-                self.vad_model,
-                sampling_rate=self.sample_rate,
-                threshold=0.35,
-                min_speech_duration_ms=160,
-                min_silence_duration_ms=180,
-                speech_pad_ms=220,
-                return_seconds=False,
-            )
-            if not speech:
-                return audio
-
-            start = max(0, int(speech[0]["start"]))
-            end = min(len(audio), int(speech[-1]["end"]))
-            return audio[start:end]
-        except Exception as e:
-            print(f"[WARN] VAD trim failed, using raw audio: {e}")
-            return audio
-
-    def _calibrate_ambient_noise(self) -> None:
-        """Measure the room floor briefly so fixed thresholds do not punish quiet/loud microphones."""
-        if self.calibrate_seconds <= 0 or self.stream is None:
-            return
-
-        print(f"[INFO] Calibrating ambient noise for {self.calibrate_seconds:.1f}s...")
-        energies = []
-        chunks = max(1, int((self.sample_rate / self.chunk_size) * self.calibrate_seconds))
-
-        for _ in range(chunks):
-            try:
-                data = self.stream.read(self.chunk_size, exception_on_overflow=False)
-                audio_chunk = np.frombuffer(data, dtype=np.float32)
-                energies.append(self._get_audio_energy(audio_chunk))
-            except Exception as e:
-                print(f"[WARN] Ambient calibration failed: {e}")
-                return
-
-        if not energies:
-            return
-
-        noise_floor = float(np.percentile(energies, 80))
-        old_energy = self.energy_threshold
-        old_speech = self.speech_trigger_rms
-        self.energy_threshold = max(self.energy_threshold, noise_floor * 2.5)
-        self.speech_trigger_rms = max(self.speech_trigger_rms, noise_floor * 3.0)
-
-        print(
-            "[INFO] Ambient RMS "
-            f"{noise_floor:.5f}; silence threshold {old_energy:.5f}->{self.energy_threshold:.5f}; "
-            f"wake trigger {old_speech:.5f}->{self.speech_trigger_rms:.5f}"
-        )
-
-    def _tail_audio(self, audio: np.ndarray, duration_seconds: float) -> np.ndarray:
-        """Keep only the tail of an audio buffer so command capture starts near the wake word."""
-        if len(audio) == 0 or duration_seconds <= 0:
-            return np.array([], dtype=np.float32)
-
-        tail_samples = int(self.sample_rate * duration_seconds)
-        if tail_samples <= 0:
-            return np.array([], dtype=np.float32)
-
-        return audio[-tail_samples:]
-
-    def _is_keyword_detected(self, audio: np.ndarray) -> bool:
-        """Detect wake phrase by transcribing a short window and matching text."""
-        try:
-            if len(audio) == 0:
-                return False
-
-            audio = self._prepare_audio(audio, trim_silence=True)
-            if len(audio) < int(self.sample_rate * 0.25):
-                return False
-
-            result: dict = self.wake_model.transcribe(
-                audio,
-                language=self.language,
-                fp16=self.fp16,
-                temperature=0.0,
-                no_speech_threshold=0.6,
-                logprob_threshold=-1.0,
-                compression_ratio_threshold=2.4,
-                initial_prompt=f"The wake word is {self.keyword}.",
-            )
-
-            transcribed = self._normalize_text(result.get("text", ""))
-            if not transcribed:
-                return False
-
-            detected = self.normalized_keyword in transcribed
-            if detected:
-                print(f"[INFO] Wake phrase match: '{transcribed}'")
-            return detected
-        except Exception as e:
-            print(f"[ERROR] Error in keyword detection: {e}")
-            return False
+    def _save_debug_audio(self, audio: np.ndarray) -> Path:
+        DEBUG_DIR.mkdir(exist_ok=True)
+        path = DEBUG_DIR / f"{time.strftime('%H%M%S')}-{int(time.time() * 1000) % 1000:03d}.wav"
+        with wave.open(str(path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(SAMPLE_RATE)
+            wav.writeframes((np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
+        return path
 
     def _strip_wake_phrase(self, text: str) -> str:
         """Remove wake phrase from transcription and return only the command."""
-        pattern = re.compile(rf"\b{re.escape(self.keyword)}\b", re.IGNORECASE)
-        stripped = pattern.sub("", text, count=1).strip(" ,.!?;:")
-        if stripped != text.strip(" ,.!?;:") and stripped:
-            return stripped
+        for keyword in self.keywords:
+            # Tolerate punctuation/accents between the words of a multi-word wake phrase
+            pattern = re.compile(r"\b" + r"\W+".join(re.escape(word) for word in keyword.split()) + r"\b[\s,.!?;:]*", re.IGNORECASE)
+            stripped, count = pattern.subn(" ", text, count=1)
+            if count:
+                return " ".join(stripped.split()).strip(" ,.!?;:")
 
-        normalized_text = self._normalize_text(text)
+        return text.strip(" ,.!?;:")
 
-        if self.normalized_keyword in normalized_text:
-            parts = normalized_text.split(self.normalized_keyword, 1)
-            return parts[1].strip(" ,.!?;:")
+    def _transcribe(self, model: WhisperModel, audio: np.ndarray, beam_size: int) -> str:
+        """Transcribe a single VAD-trimmed utterance."""
+        started = time.monotonic()
+        segments, _ = model.transcribe(
+            self._prepare_audio(audio),
+            language=self.language,
+            beam_size=beam_size,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            without_timestamps=True,
+            # Bias decoding towards the wake word spelling
+            hotwords=self.keyword,
+        )
+        text = " ".join(segment.text.strip() for segment in segments).strip()
+        if self.debug:
+            name = self.wake_model_name if model is self.wake_model else self.transcription_model_name
+            print(f"[DEBUG] {name} took {time.monotonic() - started:.2f}s for {len(audio) / SAMPLE_RATE:.1f}s of audio")
+        return text
 
-        return stripped or normalized_text
+    def _feed_frame(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """Feed one microphone frame to the VAD; return a full utterance when one just ended."""
+        probability = self.vad(frame)
 
-    def _record_audio_until_silence(self, timeout_seconds: int = 10, prepend_audio: Optional[np.ndarray] = None) -> np.ndarray:
-        """Record audio until silence is detected"""
-        print("[RECORDING] Listening for voice input...")
-        
-        frames = []
-        if prepend_audio is not None and len(prepend_audio) > 0:
-            frames.append(prepend_audio)
+        if not self.utterance:
+            if probability < self.vad_threshold:
+                self.pre_roll.append(frame)
+                return None
 
-        silent_chunks = 0
-        max_silent_chunks = int((self.sample_rate / self.chunk_size) * 1.0)  # 1 second of silence
-        
+            # Speech started: keep a little audio from before the trigger so
+            # the first syllable is not clipped
+            self.utterance = [*self.pre_roll, frame]
+            self.pre_roll.clear()
+            self.speech_frames = 1
+            self.silent_frames = 0
+            return None
+
+        self.utterance.append(frame)
+        if probability >= self.vad_end_threshold:
+            self.speech_frames += 1
+            self.silent_frames = 0
+        else:
+            self.silent_frames += 1
+
+        if self.silent_frames < self.end_silence_frames and len(self.utterance) < self.max_utterance_frames:
+            return None
+
+        audio = np.concatenate(self.utterance)
+        enough_speech = self.speech_frames >= self.min_speech_frames
+        self.utterance = []
+        self.vad.reset()
+        return audio if enough_speech else None
+
+    def _handle_utterance(self, audio: np.ndarray) -> None:
+        """Check a finished utterance for the wake word and dispatch the command."""
         try:
-            start_time = time.monotonic()
-            
-            while True:
-                try:
-                    if self.stream is None:
-                        print("[ERROR] Audio stream is not initialized")
-                        break
+            if time.monotonic() < self.awaiting_command_until:
+                # The wake word was said on its own; this utterance is the command
+                self.awaiting_command_until = 0.0
+                command_text = self._transcribe(self.whisper_model, audio, self.beam_size)
+            else:
+                # Cheap greedy pass with the small model, once per utterance
+                wake_text = self._transcribe(self.wake_model, audio, beam_size=1)
+                if self.debug:
+                    peak = float(np.max(np.abs(audio)))
+                    print(f"[DEBUG] Heard '{wake_text}' ({len(audio) / SAMPLE_RATE:.1f}s, peak {peak:.3f}) -> {self._save_debug_audio(audio).name}")
 
-                    data = self.stream.read(self.chunk_size, exception_on_overflow=False)
-                    audio_chunk = np.frombuffer(data, dtype=np.float32)
-                    frames.append(audio_chunk)
-                    
-                    # Check for silence
-                    energy = self._get_audio_energy(audio_chunk)
-                    if energy < self.energy_threshold:
-                        silent_chunks += 1
-                    else:
-                        silent_chunks = 0
-                    
-                    # Stop if silence detected or timeout
-                    elapsed = time.monotonic() - start_time
-                    if silent_chunks > max_silent_chunks or elapsed > timeout_seconds:
-                        print(f"[RECORDING] Finished recording ({elapsed:.1f}s)")
-                        break
-                        
-                except Exception as e:
-                    print(f"[ERROR] Error reading audio: {e}")
-                    break
-            
-            if frames:
-                return np.concatenate(frames)
-            return np.array([])
-            
-        except KeyboardInterrupt:
-            print("[INFO] Recording interrupted by user")
-            return np.array([])
+                if not self._maybe_keyword(wake_text):
+                    return
 
-    def _transcribe_audio(self, audio: np.ndarray) -> str:
-        """Transcribe audio using Whisper"""
-        try:
-            print("[INFO] Transcribing audio...")
-            
-            # Transcribe
-            prepared_audio = self._prepare_audio(audio, trim_silence=True)
-            if len(prepared_audio) < int(self.sample_rate * 0.25):
-                print("[INFO] Audio contained no clear speech")
-                return ""
+                exact = self._contains_keyword(wake_text)
+                if self.whisper_model is self.wake_model or (exact and not self._strip_wake_phrase(wake_text)):
+                    # Nothing more to learn from the bigger model
+                    text = wake_text
+                else:
+                    text = self._transcribe(self.whisper_model, audio, self.beam_size)
+                    if self.debug:
+                        print(f"[DEBUG] Transcription model heard '{text}'")
 
-            result: dict = self.whisper_model.transcribe(
-                prepared_audio,
-                language=self.language,
-                fp16=self.fp16,
-                temperature=0.0,
-                condition_on_previous_text=False,
-                no_speech_threshold=0.6,
-                logprob_threshold=-1.0,
-                compression_ratio_threshold=2.4,
-                initial_prompt=f"This is a short voice command to a local assistant named {self.keyword}.",
-            )
-            text = result.get("text", "").strip()
-            
-            print(f"[INFO] Transcribed: {text}")
-            return text
-            
+                if not exact and not self._contains_keyword(text):
+                    return
+
+                print(f"\n[WAKE WORD DETECTED] 🎤 '{text}'")
+
+                command_text = self._strip_wake_phrase(text)
+                if not command_text:
+                    self.awaiting_command_until = time.monotonic() + self.follow_up_seconds
+                    print("[LISTENING] Wake word heard, waiting for a command...")
+                    return
         except Exception as e:
             print(f"[ERROR] Error transcribing audio: {e}")
-            return ""
+            return
+
+        if not command_text:
+            return
+
+        print(f"[INFO] Transcribed: {command_text}")
+        started = time.monotonic()
+        result = self._send_to_assistant(command_text)
+        if self.debug:
+            print(f"[DEBUG] Assistant API took {time.monotonic() - started:.2f}s")
+        assistant_text = result.get("content") if isinstance(result, dict) else None
+        if assistant_text:
+            print(f"[INFO] Assistant: {assistant_text}")
+            self._speak(assistant_text)
+
+        print("\n[LISTENING] Ready for next command...\n")
+
+    def _speak(self, text: str) -> None:
+        """Speak with the microphone muted so the assistant does not hear itself."""
+        self.microphone.mute()
+        try:
+            self.speaker.speak(text)
+        finally:
+            self.microphone.unmute()
+            self.vad.reset()
+
+    def _auth_headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+
+    def _notification_loop(self) -> None:
+        """Keep a server-sent events stream open and queue what the assistant pushes."""
+        while self.is_listening:
+            try:
+                with requests.get(
+                    f"{self.api_url}/notifications/stream",
+                    params={"channel": self.channel},
+                    headers=self._auth_headers(),
+                    stream=True,
+                    # The server pings every 15s; a silent stream is a dead one
+                    timeout=(5, 45),
+                ) as response:
+                    response.raise_for_status()
+                    print(f"[INFO] Receiving notifications as '{self.channel}'")
+
+                    event = None
+                    for line in response.iter_lines(decode_unicode=True):
+                        if not self.is_listening:
+                            return
+                        if not line:
+                            event = None
+                        elif line.startswith("event:"):
+                            event = line[6:].strip()
+                        elif line.startswith("data:") and event == "notification":
+                            message = json.loads(line[5:]).get("message")
+                            if message:
+                                self.notifications.put(message)
+            except (requests.exceptions.RequestException, ValueError) as e:
+                if self.debug:
+                    print(f"[DEBUG] Notification stream dropped: {e}")
+
+            time.sleep(5)
+
+    def _speak_notifications(self) -> None:
+        """Speak pending notifications, unless the user is in the middle of talking."""
+        if self.utterance or time.monotonic() < self.awaiting_command_until:
+            return
+
+        while True:
+            try:
+                message = self.notifications.get_nowait()
+            except queue.Empty:
+                return
+
+            print(f"[NOTIFICATION] {message}")
+            self._speak(message)
 
     def _send_to_assistant(self, text: str) -> dict:
         """Send transcribed text to LocalAssistant API"""
         try:
             print("[INFO] Sending to assistant API...")
-            
+
             payload = {
                 "content": text,
+                # Lets the assistant route timer results back to this listener
+                "context": {"source": self.channel},
             }
-            
+
             response = requests.post(
                 f"{self.api_url}/requests/create",
                 json=payload,
-                headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {},
+                headers=self._auth_headers(),
                 timeout=30,
             )
 
             response.raise_for_status()
             print("[INFO] Request sent successfully")
 
-            result = response.json()
+            return response.json()
 
-            # Speak assistant reply if available
-            try:
-                assistant_text = None
-                if isinstance(result, dict):
-                    assistant_text = result.get("content")
-                if assistant_text:
-                    self._speak_text(assistant_text)
-            except Exception as e:
-                print(f"[WARN] TTS failed: {e}")
-
-            return result
-            
         except requests.exceptions.RequestException as e:
             print(f"[ERROR] Error sending to API: {e}")
             return {}
@@ -371,73 +554,26 @@ class VoiceActivationListener:
         print("="*50)
         print(f"Listening for keyword: '{self.keyword}'")
         print("Press Ctrl+C to exit\n")
-        
+
         self.is_listening = True
-        
+
         try:
-            # Open audio stream
-            self.stream = self.audio.open(
-                format=self.FORMAT,
-                channels=self.CHANNELS,
-                rate=self.sample_rate,
-                input=True,
-                input_device_index=self.device_id,
-                frames_per_buffer=self.chunk_size,
-            )
+            self.microphone.start()
+            threading.Thread(target=self._notification_loop, daemon=True).start()
 
-            self._calibrate_ambient_noise()
-            
-            keyword_window = 3  # seconds of audio for keyword matching
-            keyword_samples = int(self.sample_rate * keyword_window)
-            keyword_buffer: deque[float] = deque(maxlen=keyword_samples)
-            last_wake_check = 0.0
-            last_trigger = 0.0
-            
             while self.is_listening:
-                try:
-                    data = self.stream.read(self.chunk_size, exception_on_overflow=False)
-                    audio_chunk = np.frombuffer(data, dtype=np.float32)
-                    
-                    keyword_buffer.extend(audio_chunk)
+                self._speak_notifications()
 
-                    if len(keyword_buffer) >= self.chunk_size:
-                        buffer_array = self._to_audio_array(keyword_buffer)
+                frame = self.microphone.read_frame()
+                if frame is None:
+                    continue
 
-                        now = time.monotonic()
-                        window_energy = self._get_audio_energy(buffer_array)
-                        should_check = (
-                            window_energy >= self.speech_trigger_rms
-                            and now - last_wake_check >= self.wake_check_interval
-                            and now - last_trigger >= self.min_trigger_interval
-                        )
+                audio = self._feed_frame(frame)
+                if audio is not None:
+                    self._handle_utterance(audio)
 
-                        if should_check:
-                            last_wake_check = now
-
-                        if should_check and self._is_keyword_detected(buffer_array):
-                            last_trigger = time.monotonic()
-                            print("\n[WAKE WORD DETECTED] 🎤")
-                            
-                            audio_input = self._record_audio_until_silence(
-                                prepend_audio=self._tail_audio(buffer_array, self.wake_prepend_seconds)
-                            )
-                            
-                            if len(audio_input) > 0:
-                                text = self._transcribe_audio(audio_input)
-
-                                command_text = self._strip_wake_phrase(text)
-                                if command_text:
-                                    self._send_to_assistant(command_text)
-                                else:
-                                    print("[INFO] Wake word detected but no command captured after it")
-                            
-                            keyword_buffer.clear()
-                            print("\n[LISTENING] Ready for next command...\n")
-                            
-                except KeyboardInterrupt:
-                    print("\n[INFO] Stopping listener...")
-                    break
-                    
+        except KeyboardInterrupt:
+            print("\n[INFO] Stopping listener...")
         except Exception as e:
             print(f"[ERROR] Error in listening loop: {e}")
         finally:
@@ -445,38 +581,13 @@ class VoiceActivationListener:
 
     def stop(self):
         """Stop listening"""
+        if not self.is_listening:
+            return
+
         self.is_listening = False
-        
-        if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-        
+        self.microphone.stop()
         self.audio.terminate()
         print("[INFO] Voice activation listener stopped")
-
-    def _speak_text(self, text: str) -> None:
-        """Speak text using macOS `say` command or fall back to pyttsx3 if available."""
-        try:
-            system = platform.system()
-            if system == "Darwin":
-                # Use macOS built-in TTS
-                subprocess.run(["say", text], check=False)
-                return
-
-            # Try pyttsx3 as a fallback for other platforms
-            try:
-                import pyttsx3
-
-                engine = pyttsx3.init()
-                engine.say(text)
-                engine.runAndWait()
-                return
-            except Exception:
-                print("[WARN] pyttsx3 unavailable or failed to play audio")
-
-            print(f"[INFO] Assistant: {text}")
-        except Exception as e:
-            print(f"[ERROR] Error speaking text: {e}")
 
 def list_audio_devices():
     """List available audio input devices"""
@@ -488,34 +599,35 @@ def list_audio_devices():
         default_index = audio.get_default_input_device_info().get('index')
     except Exception:
         default_index = None
-    
+
     for i in range(audio.get_device_count()):
         info = audio.get_device_info_by_index(i)
         max_input_channels = int(info.get('maxInputChannels', 0) or 0)
 
         if max_input_channels > 0:
-            marker = " \u2190 DEFAULT" if (default_index is not None and i == default_index) else ""
+            marker = " ← DEFAULT" if (default_index is not None and i == default_index) else ""
             print(f"[{i}] {info['name']}{marker}")
             print(f"    Channels: {max_input_channels}, Sample Rate: {int(info['defaultSampleRate'])}")
-    
+
     print("-" * 50 + "\n")
     audio.terminate()
 
 if __name__ == "__main__":
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Voice Activation Listener")
     # Prefer environment variables when CLI args aren't provided
     parser.add_argument("--keyword", default=os.getenv("WAKE_WORD", "lisa"), help="Wake word to listen for")
+    parser.add_argument("--aliases", default=os.getenv("WAKE_WORD_ALIASES", ""), help="Comma-separated alternative spellings of the wake word, for example liza,lysa")
     parser.add_argument("--language", default=os.getenv("LISTENER_LANGUAGE"), help="Whisper language code, for example en or it. Leave unset for auto-detect")
     parser.add_argument("--api-url", help="LocalAssistant API URL")
     parser.add_argument("--device", type=int, help="Audio device ID to use")
     parser.add_argument("--list-devices", action="store_true", help="List available audio devices")
-    parser.add_argument("--threshold", type=float, default=float(os.getenv("DETECTION_THRESHOLD", 0.01)), help="Silence RMS threshold (default: 0.01)")
-    parser.add_argument("--speech-trigger", type=float, default=float(os.getenv("SPEECH_TRIGGER_RMS", 0.008)), help="Minimum RMS to run wake-word check")
-    
+    parser.add_argument("--debug", action="store_true", default=os.getenv("LISTENER_DEBUG", "") == "1", help="Print everything that is heard and save each utterance to worker/debug")
+    parser.add_argument("--threshold", type=float, default=float(os.getenv("VAD_THRESHOLD", 0.5)), help="Speech probability (0-1) needed to start capturing (default: 0.5)")
+
     args = parser.parse_args()
-    
+
     if args.list_devices:
         list_audio_devices()
         sys.exit(0)
@@ -532,15 +644,12 @@ if __name__ == "__main__":
     # Start listener
     listener = VoiceActivationListener(
         keyword=args.keyword,
+        keyword_aliases=[alias for alias in args.aliases.split(",") if alias.strip()],
         language=args.language,
         api_url=args.api_url,
         device_id=args.device,
-        energy_threshold=args.threshold,
-        speech_trigger_rms=args.speech_trigger,
+        vad_threshold=args.threshold,
+        debug=args.debug,
     )
-    
-    try:
-        listener.start()
-    except KeyboardInterrupt:
-        print("\n[INFO] Exiting...")
-        listener.stop()
+
+    listener.start()
