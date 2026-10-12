@@ -86,9 +86,21 @@ const DOMAIN_ACTIONS: Record<string, DeviceAction[]> = {
   climate: [
     action("turn_on", "Turn the thermostat on"),
     action("turn_off", "Turn the thermostat off"),
-    action("set_temperature", "Set the target temperature", {
-      temperature: { type: "number", required: true },
-    }),
+    action(
+      "set_temperature",
+      "Set the target temperature, or both ends of the range on thermostats that keep one",
+      {
+        temperature: { type: "number", description: "Single target" },
+        target_temp_low: {
+          type: "number",
+          description: "Low end of the range",
+        },
+        target_temp_high: {
+          type: "number",
+          description: "High end of the range",
+        },
+      },
+    ),
     action("set_hvac_mode", "Change the operating mode", {
       hvac_mode: {
         type: "string",
@@ -123,6 +135,13 @@ const DOMAIN_ACTIONS: Record<string, DeviceAction[]> = {
   script: [action("turn_on", "Run the script")],
 };
 
+// Bits of the supported_features attribute an entity needs for an action
+const REQUIRED_FEATURES: Record<string, number> = {
+  "cover.set_cover_position": 4,
+  "cover.stop_cover": 8,
+  "fan.set_percentage": 1,
+};
+
 // Attributes worth showing to the model; the rest is mostly noise
 const STATE_ATTRIBUTES = [
   "brightness",
@@ -130,6 +149,8 @@ const STATE_ATTRIBUTES = [
   "percentage",
   "current_position",
   "temperature",
+  "target_temp_low",
+  "target_temp_high",
   "current_temperature",
   "hvac_modes",
   "hvac_action",
@@ -173,8 +194,14 @@ class HomeAssistantAdapter implements DeviceAdapter {
 
   private toDevice(entity: EntityState): Device | null {
     const domain = entity.entity_id.split(".")[0];
-    const actions = DOMAIN_ACTIONS[domain];
-    if (!actions || !this.domains.includes(domain)) return null;
+    const domainActions = DOMAIN_ACTIONS[domain];
+    if (!domainActions || !this.domains.includes(domain)) return null;
+
+    const features = Number(entity.attributes.supported_features ?? 0);
+    const actions = domainActions.filter((a) => {
+      const required = REQUIRED_FEATURES[`${domain}.${a.id}`] ?? 0;
+      return (features & required) === required;
+    });
 
     const state: Record<string, unknown> = { state: entity.state };
     for (const attribute of STATE_ATTRIBUTES) {
@@ -228,6 +255,17 @@ class HomeAssistantAdapter implements DeviceAdapter {
     const device = await this.getDevice(deviceId);
     const deviceAction = device?.actions.find((a) => a.id === actionId);
     if (!device || !deviceAction) return false;
+
+    if (
+      device.type === "climate" &&
+      deviceAction.id === "set_temperature" &&
+      params.temperature === undefined &&
+      (params.target_temp_low === undefined ||
+        params.target_temp_high === undefined)
+    )
+      throw new DeviceManagerError(
+        "set_temperature requires either temperature or both target_temp_low and target_temp_high",
+      );
 
     // Only forward the parameters the action declares
     const data: Record<string, unknown> = { entity_id: device.id };

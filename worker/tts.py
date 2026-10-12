@@ -124,12 +124,12 @@ class Speaker:
 
     def _speak_system(self, text: str) -> None:
         if platform.system() == "Darwin":
-            subprocess.run(["say", text], check=False)
+            subprocess.run(["say"], input=text, text=True, check=False)
             return
 
         espeak = shutil.which("espeak-ng") or shutil.which("espeak")
         if espeak:
-            subprocess.run([espeak, text], check=False)
+            subprocess.run([espeak, "--stdin"], input=text, text=True, check=False)
             return
 
         print("[WARN] No system TTS command found (install espeak-ng or use TTS_ENGINE=piper)")

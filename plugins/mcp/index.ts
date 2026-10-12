@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import {
   getDefaultEnvironment,
@@ -30,8 +31,15 @@ interface ConnectedServer {
 }
 
 // Providers only accept tool names made of these characters, up to 64 long
-const toolName = (server: string, tool: string) =>
-  `mcp-${server}_${tool}`.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+function toolName(server: string, tool: string) {
+  const raw = `mcp-${server}_${tool}`;
+  const name = raw.replace(/[^a-zA-Z0-9_-]/g, "_");
+  if (name.length <= 64) return name;
+
+  // Keep long names apart even when they share their first 64 characters
+  const hash = createHash("sha1").update(raw).digest("hex").slice(0, 8);
+  return `${name.slice(0, 55)}_${hash}`;
+}
 
 function toZodSchema(inputSchema: unknown): ToolSchema {
   try {
@@ -87,7 +95,14 @@ export default class MCPPlugin extends RegistrablePlugin {
               : { command: target, args: rest };
 
             const { tools } = await this.connect(name, config);
-            await this.saveServers({ ...this.getServers(), [name]: config });
+
+            try {
+              await this.saveServers({ ...this.getServers(), [name]: config });
+            } catch (e) {
+              // Do not keep a connection the settings know nothing about
+              await this.disconnect(name);
+              throw e;
+            }
 
             return `Connected to ${name} (${tools.length} tools)`;
           }
@@ -97,8 +112,8 @@ export default class MCPPlugin extends RegistrablePlugin {
             const { [name]: removed, ...servers } = this.getServers();
             if (!removed) return `Server ${name} not found`;
 
-            await this.disconnect(name);
             await this.saveServers(servers);
+            await this.disconnect(name);
 
             return `Removed ${name}`;
           }
@@ -151,12 +166,12 @@ export default class MCPPlugin extends RegistrablePlugin {
           });
 
     const client = new Client({ name: "lisa", version: "1.0.0" });
-    await client.connect(transport);
-
     const server: ConnectedServer = { client, tools: [] };
     const toolHandler = this.assistant.getHandler("tool");
 
     try {
+      await client.connect(transport);
+
       let cursor: string | undefined;
 
       do {

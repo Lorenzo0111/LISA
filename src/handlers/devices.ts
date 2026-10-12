@@ -96,6 +96,15 @@ export class DeviceHandler extends Handler {
     if (!action)
       throw new DeviceManagerError(`Action with id ${actionId} not found`);
 
+    // A misspelled parameter would otherwise be dropped and the action still succeed
+    const unknown = Object.keys(params).filter(
+      (name) => !action.parameters?.[name],
+    );
+    if (unknown.length > 0)
+      throw new DeviceManagerError(
+        `Action ${action.id} does not accept the ${unknown.join(", ")} parameter`,
+      );
+
     for (const [name, parameter] of Object.entries(action.parameters ?? {})) {
       const value = params[name];
 

@@ -5,6 +5,9 @@ import { z } from "zod";
 import { assistant } from "../../assistant";
 import type { NotificationChannel } from "../../handlers/notifications";
 
+// Channels created by the stream route, the only ones a client may replace
+const streamChannels = new WeakSet<NotificationChannel>();
+
 export const notificationsRoute = new Hono()
   .get("/channels", (ctx) => {
     return ctx.json(
@@ -51,6 +54,12 @@ export const notificationsRoute = new Hono()
       const { channel: name } = ctx.req.valid("query");
       const notifications = assistant.getHandler("notification");
 
+      const existing = notifications
+        .getChannels()
+        .find((channel) => channel.name === name);
+      if (existing && !streamChannels.has(existing))
+        return ctx.json({ error: `Channel ${name} is already in use` }, 409);
+
       return streamSSE(ctx, async (stream) => {
         const channel: NotificationChannel = {
           name,
@@ -63,16 +72,22 @@ export const notificationsRoute = new Hono()
           },
         };
 
-        notifications.registerChannel(channel);
-
-        await stream.writeSSE({ event: "ping", data: "" });
-
+        // Listen first, a client leaving during the first write must not be missed
         const closed = new Promise<void>((resolve) => stream.onAbort(resolve));
-        const heartbeat = setInterval(() => {
-          stream.writeSSE({ event: "ping", data: "" }).catch(() => {});
-        }, 15000);
+        if (stream.aborted) return;
+
+        let heartbeat: ReturnType<typeof setInterval> | undefined;
 
         try {
+          streamChannels.add(channel);
+          notifications.registerChannel(channel);
+
+          await stream.writeSSE({ event: "ping", data: "" });
+
+          heartbeat = setInterval(() => {
+            stream.writeSSE({ event: "ping", data: "" }).catch(() => {});
+          }, 15000);
+
           await closed;
         } finally {
           clearInterval(heartbeat);
