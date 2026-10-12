@@ -41,6 +41,8 @@ export class RequestHandler extends Handler {
     await prisma.message.create({
       data: {
         type: request.type,
+        source: request.context?.source,
+        userId: request.userId,
         request: request.content,
         response: response.content,
         tokens: response.tokens ?? 0,
@@ -55,6 +57,21 @@ export class RequestHandler extends Handler {
   /** The request being handled by the current async call chain, if any. */
   currentRequest(): RequestType | undefined {
     return this.activeRequest.getStore();
+  }
+
+  /** The active AI provider, if a plugin has set one. */
+  aiInfo(): { name: string; model: string | null } | null {
+    if (!this.ai) return null;
+
+    const model =
+      "model" in this.ai
+        ? (this.ai.model as string | { modelId?: string })
+        : null;
+
+    return {
+      name: this.ai.name,
+      model: typeof model === "string" ? model : (model?.modelId ?? null),
+    };
   }
 
   setAI(ai: IntelligenceProvider) {

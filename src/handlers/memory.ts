@@ -6,7 +6,7 @@ import { type AnyTool, defineTool } from "./tools";
 
 const tagSchema = z.array(z.string().trim().min(1)).default([]);
 
-function formatMemory(memory: Memory) {
+export function formatMemory(memory: Memory) {
   return {
     ...memory,
     tags: memory.tags?.split(",").map((tag) => tag.trim()) || [],

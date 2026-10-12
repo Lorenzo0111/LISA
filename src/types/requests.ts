@@ -8,4 +8,6 @@ export const requestSchema = z.object({
 
 export type RequestType = z.infer<typeof requestSchema> & {
   type?: MessageType;
+  /** Dashboard user that made the request, if any. */
+  userId?: string;
 };

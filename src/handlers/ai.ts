@@ -52,20 +52,23 @@ export class BasicAIProvider extends IntelligenceProvider {
           .getHandler("setting")
           .getSettings(["AI_SYSTEM_PROMPT", "AI_SYSTEM_MEMORY"]);
 
+        // "0" is how the CLI turns it off, false is how the dashboard does
+        const memoryEnabled =
+          AI_SYSTEM_MEMORY?.value !== "0" && AI_SYSTEM_MEMORY?.value !== false;
         let memoryTitles: Record<number, string> = {};
 
-        if (AI_SYSTEM_MEMORY?.value !== "0")
+        if (memoryEnabled)
           memoryTitles = await assistant.getHandler("memory").listTitles();
 
         return {
           ...settings,
           tools,
           instructions:
-            (AI_SYSTEM_PROMPT?.value as string) ??
+            (AI_SYSTEM_PROMPT?.value as string) ||
             generateSystemPrompt({
               tools: toolNames,
               memory: {
-                enabled: AI_SYSTEM_MEMORY?.value !== "0",
+                enabled: memoryEnabled,
                 titles: memoryTitles,
               },
             }),

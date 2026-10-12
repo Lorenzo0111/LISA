@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import sys
 import re
 import time
@@ -34,6 +35,9 @@ VAD_FRAME_SAMPLES = 512
 VAD_CONTEXT_SAMPLES = 64
 
 DEBUG_DIR = Path(__file__).resolve().parent / "debug"
+
+# Reported to the assistant when this worker registers as a speaker
+WORKER_VERSION = "1.1.0"
 
 
 class StreamingVAD:
@@ -232,50 +236,63 @@ class VoiceActivationListener:
         keyword_aliases: Optional[List[str]] = None,
         debug: bool = False,
     ):
-        self.keyword = keyword.lower()
-        # Aliases cover spellings Whisper tends to produce for the wake word (e.g. "liza")
-        self.keywords = [k for k in (self._normalize_text(k) for k in [self.keyword, *(keyword_aliases or [])]) if k]
-        self.language = language.lower() if language else None
         self.api_url = api_url or os.getenv("ASSISTANT_API_URL", "http://localhost:3000")
         self.api_key = api_key or os.getenv("ASSISTANT_API_KEY", "")
-        # Name this listener registers under to receive notifications (timers, reminders)
+        # Id this listener registers under: its speaker id in the dashboard and
+        # the channel it receives notifications (timers, reminders) on
         self.channel = os.getenv("ASSISTANT_CHANNEL", "voice")
         self.notifications: "queue.Queue[str]" = queue.Queue()
-        self.vad_threshold = vad_threshold
-        # Hysteresis: once speaking, require a clearly lower probability to count as silence
-        self.vad_end_threshold = max(vad_threshold - 0.15, 0.05)
-        if end_silence_seconds is None:
-            end_silence_seconds = float(os.getenv("END_SILENCE_SECONDS", 0.8))
-        self.end_silence_frames = self._seconds_to_frames(end_silence_seconds)
         self.debug = debug
         self.max_utterance_frames = self._seconds_to_frames(max_utterance_seconds)
         self.min_speech_frames = self._seconds_to_frames(0.25)
-        self.follow_up_seconds = follow_up_seconds
-        self.wake_model_name = wake_model_name or os.getenv("WAKE_MODEL", "tiny")
-        self.transcription_model_name = transcription_model_name or os.getenv("TRANSCRIPTION_MODEL", "small")
         self.device = os.getenv("WHISPER_DEVICE", "auto")
         # int8 quantization roughly halves memory and is the fastest option on CPUs
         self.compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "default" if self.device == "cuda" else "int8")
         self.cpu_threads = int(os.getenv("WHISPER_THREADS", 0))
         self.beam_size = int(os.getenv("WHISPER_BEAM_SIZE", 5))
 
+        # What this machine would use on its own (.env and CLI arguments). The
+        # assistant keeps it for a speaker it sees for the first time; after
+        # that the configuration set in the dashboard wins
+        if end_silence_seconds is None:
+            end_silence_seconds = float(os.getenv("END_SILENCE_SECONDS", 0.8))
+        self.config = {
+            "wakeWord": keyword.lower(),
+            # Aliases cover spellings Whisper tends to produce for the wake word (e.g. "liza")
+            "wakeWordAliases": [alias.strip() for alias in (keyword_aliases or []) if alias.strip()],
+            "language": language.lower() if language else None,
+            "wakeModel": wake_model_name or os.getenv("WAKE_MODEL", "tiny"),
+            "transcriptionModel": transcription_model_name or os.getenv("TRANSCRIPTION_MODEL", "small"),
+            "vadThreshold": vad_threshold,
+            "endSilenceSeconds": end_silence_seconds,
+            "followUpSeconds": follow_up_seconds,
+            "ttsEngine": os.getenv("TTS_ENGINE", "piper").lower(),
+            "ttsVoice": os.getenv("PIPER_VOICE") or None,
+            "ttsSpeed": float(os.getenv("TTS_SPEED", 1.0)),
+            "micMuted": False,
+        }
+        # Configuration pushed by the assistant, applied by the listening loop
+        self.pending_config: Optional[dict] = None
+        self.registered = False
+        self.mic_muted = False
+
+        remote = self._register()
+        if remote:
+            self.config.update(remote)
+        self._apply_settings(self.config)
+
         self.audio = pyaudio.PyAudio()
         self.microphone = Microphone(self.audio, device_id)
         self.is_listening = False
 
-        print(f"[INFO] Loading Whisper wake model ({self.wake_model_name}, {self.compute_type})...")
-        self.wake_model = self._load_whisper(self.wake_model_name)
-
-        if self.transcription_model_name == self.wake_model_name:
-            self.whisper_model = self.wake_model
-        else:
-            print(f"[INFO] Loading Whisper transcription model ({self.transcription_model_name}, {self.compute_type})...")
-            self.whisper_model = self._load_whisper(self.transcription_model_name)
+        self._load_models()
 
         print("[INFO] Loading Silero VAD model...")
         self.vad = StreamingVAD()
 
-        self.speaker = Speaker(self.audio, language=self.language)
+        self._load_speaker()
+        if self.mic_muted:
+            self.microphone.mute()
 
         # Utterance segmentation state
         self.pre_roll: "deque[np.ndarray]" = deque(maxlen=self._seconds_to_frames(0.3))
@@ -294,6 +311,106 @@ class VoiceActivationListener:
 
     def _load_whisper(self, name: str) -> WhisperModel:
         return WhisperModel(name, device=self.device, compute_type=self.compute_type, cpu_threads=self.cpu_threads)
+
+    def _load_models(self) -> None:
+        print(f"[INFO] Loading Whisper wake model ({self.wake_model_name}, {self.compute_type})...")
+        self.wake_model = self._load_whisper(self.wake_model_name)
+
+        if self.transcription_model_name == self.wake_model_name:
+            self.whisper_model = self.wake_model
+        else:
+            print(f"[INFO] Loading Whisper transcription model ({self.transcription_model_name}, {self.compute_type})...")
+            self.whisper_model = self._load_whisper(self.transcription_model_name)
+
+    def _load_speaker(self) -> None:
+        self.speaker = Speaker(
+            self.audio,
+            engine=self.config["ttsEngine"],
+            voice=self.config["ttsVoice"],
+            language=self.language,
+            speed=self.config["ttsSpeed"],
+        )
+
+    def _apply_settings(self, config: dict) -> None:
+        """Turn a configuration into the values the listening loop works with."""
+        self.keyword = str(config["wakeWord"]).lower()
+        self.keywords = [k for k in (self._normalize_text(k) for k in [self.keyword, *config["wakeWordAliases"]]) if k]
+        self.language = config["language"] or None
+        self.vad_threshold = float(config["vadThreshold"])
+        # Hysteresis: once speaking, require a clearly lower probability to count as silence
+        self.vad_end_threshold = max(self.vad_threshold - 0.15, 0.05)
+        self.end_silence_frames = self._seconds_to_frames(float(config["endSilenceSeconds"]))
+        self.follow_up_seconds = float(config["followUpSeconds"])
+        self.wake_model_name = config["wakeModel"]
+        self.transcription_model_name = config["transcriptionModel"]
+        self.mic_muted = bool(config["micMuted"])
+
+    def _register(self) -> Optional[dict]:
+        """Announce this worker to the assistant; returns the configuration it stores for it."""
+        try:
+            response = requests.post(
+                f"{self.api_url}/speakers/register",
+                json={
+                    "id": self.channel,
+                    "hostname": socket.gethostname(),
+                    "version": WORKER_VERSION,
+                    "defaults": self.config,
+                },
+                headers=self._auth_headers(),
+                timeout=10,
+            )
+            response.raise_for_status()
+            config = response.json().get("config")
+        except (requests.exceptions.RequestException, ValueError) as e:
+            print(f"[WARN] Could not register with the assistant ({e}); using the local configuration")
+            return None
+
+        self.registered = True
+        print(f"[INFO] Registered as speaker '{self.channel}'")
+        # Ignore anything a newer assistant sends that this worker does not know
+        return {key: value for key, value in (config or {}).items() if key in self.config}
+
+    def _apply_pending_config(self) -> None:
+        """Apply a configuration pushed by the assistant without restarting."""
+        if self.utterance:
+            # Mid-sentence: wait until the user stops talking
+            return
+
+        config, self.pending_config = self.pending_config, None
+        if not config:
+            return
+
+        previous = dict(self.config)
+        self.config.update({key: value for key, value in config.items() if key in self.config})
+        if self.config == previous:
+            return
+
+        def changed(*keys: str) -> bool:
+            return any(self.config[key] != previous[key] for key in keys)
+
+        print("[INFO] Applying configuration from the assistant")
+        try:
+            self._apply_settings(self.config)
+            if changed("wakeModel", "transcriptionModel"):
+                self._load_models()
+            if changed("ttsEngine", "ttsVoice", "ttsSpeed", "language"):
+                self._load_speaker()
+        except Exception as e:
+            print(f"[ERROR] Could not apply the new configuration ({e}); keeping the previous one")
+            self.config = previous
+            self._apply_settings(previous)
+            return
+
+        if not changed("micMuted"):
+            return
+
+        if self.mic_muted:
+            self.microphone.mute()
+            print("[INFO] Microphone muted from the dashboard")
+        else:
+            self.microphone.unmute()
+            self.vad.reset()
+            print(f"[LISTENING] Microphone back on, keyword: '{self.keyword}'")
 
     def _normalize_text(self, text: str) -> str:
         """Normalize text to improve wake-phrase matching."""
@@ -467,7 +584,9 @@ class VoiceActivationListener:
         try:
             self.speaker.speak(text)
         finally:
-            self.microphone.unmute()
+            # Stay muted when the microphone was turned off from the dashboard
+            if not self.mic_muted:
+                self.microphone.unmute()
             self.vad.reset()
 
     def _auth_headers(self) -> dict:
@@ -476,6 +595,12 @@ class VoiceActivationListener:
     def _notification_loop(self) -> None:
         """Keep a server-sent events stream open and queue what the assistant pushes."""
         while self.is_listening:
+            # The assistant may not have been reachable when this worker started
+            if not self.registered:
+                remote = self._register()
+                if remote:
+                    self.pending_config = remote
+
             try:
                 with requests.get(
                     f"{self.api_url}/notifications/stream",
@@ -500,6 +625,8 @@ class VoiceActivationListener:
                             message = json.loads(line[5:]).get("message")
                             if message:
                                 self.notifications.put(message)
+                        elif line.startswith("data:") and event == "config":
+                            self.pending_config = json.loads(line[5:])
             except (requests.exceptions.RequestException, ValueError) as e:
                 if self.debug:
                     print(f"[DEBUG] Notification stream dropped: {e}")
@@ -562,6 +689,8 @@ class VoiceActivationListener:
             threading.Thread(target=self._notification_loop, daemon=True).start()
 
             while self.is_listening:
+                if self.pending_config is not None:
+                    self._apply_pending_config()
                 self._speak_notifications()
 
                 frame = self.microphone.read_frame()
