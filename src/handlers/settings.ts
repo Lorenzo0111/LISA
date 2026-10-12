@@ -3,6 +3,8 @@ import { prisma } from "../services/prisma";
 import {
   defaultNotificationChannelSchema,
   enabledPluginsSchema,
+  systemMemorySchema,
+  systemPromptSchema,
 } from "../types/settings";
 import { Handler } from "./handler";
 
@@ -17,9 +19,11 @@ export class SettingHandler extends Handler {
   private readonly schemaRegistry: Record<string, string> = {};
 
   async load() {
-    this.registerPluginSettings({
+    await this.registerPluginSettings({
       ENABLED_PLUGINS: enabledPluginsSchema,
       NOTIFICATION_DEFAULT_CHANNEL: defaultNotificationChannelSchema,
+      AI_SYSTEM_PROMPT: systemPromptSchema,
+      AI_SYSTEM_MEMORY: systemMemorySchema,
     });
 
     const dbSettings = await prisma.setting.findMany();
@@ -51,13 +55,37 @@ export class SettingHandler extends Handler {
   }
 
   getSetting<T>(key: string): LoadedSetting<T> | undefined {
-    return this.settings.find((setting) => setting.key === key) as
-      | LoadedSetting<T>
-      | undefined;
+    const setting = this.settings.find((setting) => setting.key === key);
+
+    // A setting that is only declared (or was cleared) counts as not set
+    if (setting?.value === null || setting?.value === undefined)
+      return undefined;
+
+    return setting as LoadedSetting<T>;
   }
 
   allSettings(): LoadedSetting<unknown>[] {
     return [...this.settings];
+  }
+
+  /** Every known setting with its JSON schema, including the ones without a value. */
+  async describeSettings() {
+    const rows = await prisma.setting.findMany({ orderBy: { key: "asc" } });
+
+    return rows.map((row) => {
+      const schema = this.schemaRegistry[row.key] ?? row.jsonSchema;
+
+      return {
+        key: row.key,
+        value: this.getSetting(row.key)?.value ?? null,
+        schema: schema ? (JSON.parse(schema) as Record<string, unknown>) : null,
+      };
+    });
+  }
+
+  getSchema(key: string): Record<string, unknown> | null {
+    const schema = this.schemaRegistry[key];
+    return schema ? JSON.parse(schema) : null;
   }
 
   async setSetting(key: string, value: unknown, jsonSchema?: string) {
@@ -74,8 +102,7 @@ export class SettingHandler extends Handler {
       },
     });
 
-    const setting: LoadedSetting<typeof value> | undefined =
-      this.getSetting(key);
+    const setting = this.settings.find((setting) => setting.key === key);
 
     if (setting) setting.value = value;
     else this.settings.push({ key, value });

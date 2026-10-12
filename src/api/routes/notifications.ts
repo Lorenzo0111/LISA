@@ -4,6 +4,7 @@ import { streamSSE } from "hono/streaming";
 import { z } from "zod";
 import { assistant } from "../../assistant";
 import type { NotificationChannel } from "../../handlers/notifications";
+import type { SpeakerConnection } from "../../handlers/speakers";
 
 // Channels created by the stream route, the only ones a client may replace
 const streamChannels = new WeakSet<NotificationChannel>();
@@ -72,6 +73,16 @@ export const notificationsRoute = new Hono()
           },
         };
 
+        // A registered speaker also gets its configuration through the stream
+        const speakers = assistant.getHandler("speaker");
+        const connection: SpeakerConnection = {
+          async pushConfig(config) {
+            await stream.writeSSE({
+              event: "config",
+              data: JSON.stringify(config),
+            });
+          },
+        };
         // Listen first, a client leaving during the first write must not be missed
         const closed = new Promise<void>((resolve) => stream.onAbort(resolve));
         if (stream.aborted) return;
@@ -80,7 +91,9 @@ export const notificationsRoute = new Hono()
 
         try {
           streamChannels.add(channel);
+
           notifications.registerChannel(channel);
+          await speakers.connect(name, connection);
 
           await stream.writeSSE({ event: "ping", data: "" });
 
@@ -92,6 +105,7 @@ export const notificationsRoute = new Hono()
         } finally {
           clearInterval(heartbeat);
           notifications.unregisterChannel(channel);
+          await speakers.disconnect(name, connection);
         }
       });
     },

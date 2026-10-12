@@ -12,6 +12,8 @@ export const devicesRoute = new Hono()
     const id = ctx.req.param("id");
 
     const device = await assistant.getHandler("device").getDevice(id);
+    if (!device) return ctx.json({ error: "Device not found" }, 404);
+
     return ctx.json({
       ...device,
       adapter: undefined,

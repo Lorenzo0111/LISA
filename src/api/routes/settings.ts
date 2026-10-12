@@ -2,10 +2,14 @@ import { zValidator } from "@hono/zod-validator";
 import { Hono } from "hono";
 import { z } from "zod";
 import { assistant } from "../../assistant";
+import type { AppEnv } from "../context";
+import { adminMiddleware } from "../middlewares/auth";
 
-export const settingsRoute = new Hono()
+// Settings hold API keys and tokens, so they are for administrators only
+export const settingsRoute = new Hono<AppEnv>()
+  .use(adminMiddleware)
   .get("/", async (ctx) => {
-    const settings = assistant.getHandler("setting").allSettings();
+    const settings = await assistant.getHandler("setting").describeSettings();
 
     return ctx.json(settings);
   })
@@ -20,8 +24,28 @@ export const settingsRoute = new Hono()
     async (ctx) => {
       const key = ctx.req.param("key");
       const { value } = ctx.req.valid("json");
+      const handler = assistant.getHandler("setting");
 
-      await assistant.getHandler("setting").setSetting(key, value);
+      // null clears the setting, anything else has to fit its schema
+      const schema = handler.getSchema(key);
+      if (schema && value !== null && value !== undefined) {
+        let parsed: ReturnType<z.ZodType["safeParse"]> | undefined;
+        try {
+          parsed = z
+            .fromJSONSchema(schema as Parameters<typeof z.fromJSONSchema>[0])
+            .safeParse(value);
+        } catch {
+          // A schema zod cannot rebuild is not a reason to refuse the value
+        }
+
+        if (parsed && !parsed.success)
+          return ctx.json(
+            { error: `Invalid value: ${z.prettifyError(parsed.error)}` },
+            400,
+          );
+      }
+
+      await handler.setSetting(key, value ?? null);
 
       return ctx.json({
         success: true,
