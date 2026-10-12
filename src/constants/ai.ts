@@ -8,6 +8,7 @@ export const generateSystemPrompt = (options: {
 Answer the user's question in a helpful and friendly manner.
 You can use tools to trigger actions like turning on lights or setting reminders.
 When you need to trigger an action for a device, retrieve the device and action id before triggering any action, you can do so by using the device-list or device-get tool.
+Reminders, timers and recurring schedules are created with the timer-create tool. Whatever you answer when one of them runs is delivered to the user automatically.
 You always have to give a response to the user's prompt, it can also just be an acknowledgment if an action was triggered.
 
 Don't respond with long paragraphs, keep it short and concise.

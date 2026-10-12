@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { assistant } from "../assistant";
 import { prisma } from "../services/prisma";
 import { InvalidSetupError } from "../types/errors";
@@ -9,6 +10,7 @@ import { Handler } from "./handler";
 export class RequestHandler extends Handler {
   readonly name = "request";
   private ai?: IntelligenceProvider;
+  private readonly activeRequest = new AsyncLocalStorage<RequestType>();
 
   async load(): Promise<void> {}
   async unload(): Promise<void> {}
@@ -31,10 +33,9 @@ export class RequestHandler extends Handler {
           })
         : [];
 
-    const response = await this.ai.process(
-      previousMessages,
-      request.content,
-      request.context,
+    const ai = this.ai;
+    const response = await this.activeRequest.run(request, () =>
+      ai.process(previousMessages, request.content, request.context),
     );
 
     await prisma.message.create({
@@ -49,6 +50,11 @@ export class RequestHandler extends Handler {
     assistant.eventBus.emit("request:process", request, response);
 
     return response;
+  }
+
+  /** The request being handled by the current async call chain, if any. */
+  currentRequest(): RequestType | undefined {
+    return this.activeRequest.getStore();
   }
 
   setAI(ai: IntelligenceProvider) {

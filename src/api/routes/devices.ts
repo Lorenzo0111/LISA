@@ -23,6 +23,7 @@ export const devicesRoute = new Hono()
       "json",
       z.object({
         action: z.string(),
+        params: z.record(z.string(), z.unknown()).optional(),
       }),
     ),
     async (ctx) => {
@@ -31,7 +32,7 @@ export const devicesRoute = new Hono()
 
       const res = await assistant
         .getHandler("device")
-        .executeAction(id, body.action);
+        .executeAction(id, body.action, body.params);
       return ctx.json({
         success: res,
       });

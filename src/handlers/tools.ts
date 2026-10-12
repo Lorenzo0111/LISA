@@ -39,6 +39,14 @@ export class ToolHandler extends Handler {
     this.tools.push(tool);
   }
 
+  unregisterTool(name: string): boolean {
+    const index = this.tools.findIndex((t) => t.name === name);
+    if (index === -1) return false;
+
+    this.tools.splice(index, 1);
+    return true;
+  }
+
   registerTools(recorder: ToolRecorder): void {
     for (const tool of recorder.getTools())
       this.registerTool({

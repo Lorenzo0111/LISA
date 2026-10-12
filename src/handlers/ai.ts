@@ -30,22 +30,24 @@ export class BasicAIProvider extends IntelligenceProvider {
     super();
     this.model = model;
 
-    const tools: Record<string, Tool> = {};
-    const toolNames: Record<string, string> = {};
-
-    for (const toolData of assistant.getHandler("tool").tools) {
-      tools[toolData.name] = tool({
-        description: toolData.description,
-        inputSchema: toolData.requiredArgs,
-        execute: async (args) =>
-          await assistant.getHandler("tool").executeTool(toolData.name, args),
-      });
-      toolNames[toolData.name] = toolData.description;
-    }
-
     this.agent = new ToolLoopAgent({
       model: this.model,
       prepareCall: async (settings) => {
+        const tools: Record<string, Tool> = {};
+        const toolNames: Record<string, string> = {};
+
+        for (const toolData of assistant.getHandler("tool").tools) {
+          tools[toolData.name] = tool({
+            description: toolData.description,
+            inputSchema: toolData.requiredArgs,
+            execute: async (args) =>
+              await assistant
+                .getHandler("tool")
+                .executeTool(toolData.name, args),
+          });
+          toolNames[toolData.name] = toolData.description;
+        }
+
         const [AI_SYSTEM_PROMPT, AI_SYSTEM_MEMORY] = assistant
           .getHandler("setting")
           .getSettings(["AI_SYSTEM_PROMPT", "AI_SYSTEM_MEMORY"]);
@@ -57,6 +59,7 @@ export class BasicAIProvider extends IntelligenceProvider {
 
         return {
           ...settings,
+          tools,
           instructions:
             (AI_SYSTEM_PROMPT?.value as string) ??
             generateSystemPrompt({
@@ -68,7 +71,6 @@ export class BasicAIProvider extends IntelligenceProvider {
             }),
         };
       },
-      tools,
       headers: {
         "X-Title": "LISA",
         "HTTP-Referer": "https://github.com/Lorenzo0111/LISA",
